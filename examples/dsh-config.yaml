@@ -1,0 +1,76 @@
+# DSH YAML configuration example for Memory Palace
+
+plugins:
+  - "@dsh-plugins/memory-palace"
+
+memoryPalace:
+  # Where the SQLite database lives. ${workspace} resolves to the
+  # active DSH workspace directory at install time.
+  storagePath: "${workspace}/.dsh/memory-palace.db"
+
+  embedding:
+    # Use the real DeepSeek Embedding API for high-quality vectors.
+    # - No apiKey set            → offline-bm25 is used from the start.
+    # - API unreachable at runs  → a circuit breaker opens and embeddings
+    #                              are served by offline-bm25 until the API
+    #                              recovers (vectors are space-tagged, so
+    #                              the two never get compared).
+    provider: deepseek
+    model: deepseek-embed
+    dimensions: 1024
+    apiKey: ${DEEPSEEK_API_KEY}
+    baseUrl: https://api.deepseek.com
+
+  retrieval:
+    topK: 8              # items returned per query
+    mmrLambda: 0.5       # 0 = pure diversity, 1 = pure relevance
+    minScore: 0.1        # floor on RAW cosine (pre-decay); ~0.3 for dense providers
+    rerank: true         # add keyword rerank on top of vector recall
+    graphBoost: 0.15     # zero-mean PageRank prior (0 disables)
+    prf:                # pseudo-relevance feedback (Rocchio 2nd pass)
+      enabled: true
+      alpha: 0.7        # weight of the original query vector
+      beta: 0.3         # weight of the top-hit centroid
+      depth: 3          # top hits forming the centroid
+    entityHop: true     # recall items linked to top-hit entities
+    queryCache: true    # near-duplicate queries skip the pipeline
+
+  compression:
+    enabled: true
+    triggerCount: 200    # run when total item count crosses this
+    importanceThreshold: 0.35  # evict below this importance
+    decayHalfLifeDays: 14       # older items lose score exponentially
+
+  graph:
+    enabled: true
+    maxEntities: 5000
+    pagerankDamping: 0.85
+    pagerankIterations: 20         # power-iteration rounds for the rank kernel
+    pagerankEdgeDecayDays: 30      # half-life (days) for edge recency; 0 disables
+    personalizationWeight: 0.6     # PPR-vs-global blend when query entities are known
+
+  injection:
+    enabled: true
+    maxTokens: 2000
+    warmRanks: true      # pre-warm personalized PageRank at session start
+    systemPromptPrefix: |
+      You have access to a long-term memory palace. When the user references
+      past context, consult it via the memory_retrieve tool before answering.
+
+  # scope sets the home visibility tier for NEW memories. Every scoppable
+  # row — memory items, graph entities, graph edges — carries one of four
+  # visibility tiers:
+  #   session   → only the owning session
+  #   workspace → only the owning workspace
+  #   user      → only the owning user (plus global)
+  #   global    → everyone (shared knowledge base)
+  # Retrieval widens cumulatively (session → workspace → user → global) only
+  # while the candidate pool is thin, and never crosses an owner boundary.
+  # memory_remember accepts a per-item visibility override ("remember this
+  # globally"); anonymous callers see the global tier only.
+  #
+  # scope never widens into OTHER users' memories:
+  #   user      → own + global memories, across all sessions
+  #   workspace → this workspace, widening to own + global when thin
+  #   session   → this session, widening to workspace, then own + global
+  scope: user

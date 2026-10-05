@@ -1,0 +1,261 @@
+{
+  "name": "@dsh-plugins/memory-palace",
+  "displayName": "Memory Palace",
+  "version": "0.7.1",
+  "description": "Layered long-term memory for DeepSeek Harness agents — and any MCP client. Memory Capsules for inter-agent knowledge transport, self-reflective retrieval tuning, four-tier visibility ACL, PRF + entity-hop recall, as-of flashback, personalized PageRank, tombstone right-to-be-forgotten.",
+  "author": {
+    "name": "DSH Community"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/dsh-plugins/memory-palace",
+  "topics": [
+    "dsh-plugin",
+    "agent",
+    "memory",
+    "rag"
+  ],
+  "cordis": {
+    "minKernelVersion": "0.6.0",
+    "maxKernelVersion": "3.0.0",
+    "services": [
+      "memory-store",
+      "memory-ingestor",
+      "memory-retriever",
+      "memory-compressor",
+      "memory-graph",
+      "context-injector",
+      "memory-palace",
+      "memory-federation",
+      "memory-reflector"
+    ],
+    "events": [
+      "memory.before-retrieve",
+      "memory.after-retrieve",
+      "memory.before-store",
+      "memory.after-store",
+      "memory.remembered",
+      "memory.forgotten",
+      "memory.compressed",
+      "memory.graph-updated",
+      "memory.context-injected",
+      "memory.capsule-exported",
+      "memory.capsule-imported",
+      "memory.reflected"
+    ],
+    "hooks": [
+      "session.start",
+      "session.end",
+      "message.user",
+      "message.assistant",
+      "tool.call",
+      "tool.result"
+    ]
+  },
+  "tools": [
+    "memory_retrieve",
+    "memory_remember",
+    "memory_forget",
+    "memory_inspect",
+    "memory_graph",
+    "memory_capsule_export",
+    "memory_capsule_import",
+    "memory_reflect"
+  ],
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "storagePath": {
+          "type": "string",
+          "default": "${workspace}/.dsh/memory-palace.db",
+          "description": "SQLite database file path"
+        },
+        "embedding": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "enum": [
+                "deepseek",
+                "offline-bm25"
+              ],
+              "default": "deepseek",
+              "description": "deepseek falls back to offline-bm25 at runtime when the API is unreachable (circuit breaker)"
+            },
+            "model": {
+              "type": "string",
+              "default": "deepseek-embed"
+            },
+            "dimensions": {
+              "type": "integer",
+              "default": 1024
+            },
+            "apiKey": {
+              "type": "string"
+            },
+            "baseUrl": {
+              "type": "string",
+              "default": "https://api.deepseek.com"
+            }
+          }
+        },
+        "retrieval": {
+          "type": "object",
+          "properties": {
+            "topK": {
+              "type": "integer",
+              "default": 8
+            },
+            "mmrLambda": {
+              "type": "number",
+              "default": 0.5
+            },
+            "minScore": {
+              "type": "number",
+              "default": 0.1,
+              "description": "Floor on RAW cosine similarity (pre-decay). Raise to ~0.3 for dense embedding providers"
+            },
+            "rerank": {
+              "type": "boolean",
+              "default": true
+            },
+            "graphBoost": {
+              "type": "number",
+              "default": 0.15,
+              "description": "Weight of the zero-mean PageRank prior applied to items linked to graph entities (0 disables)"
+            },
+            "prf": {
+              "type": "object",
+              "description": "Pseudo-relevance feedback (Rocchio): blend the top-hit centroid back into the query vector and re-score — zero-LLM query expansion",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "alpha": {
+                  "type": "number",
+                  "default": 0.7,
+                  "description": "Weight of the original query vector"
+                },
+                "beta": {
+                  "type": "number",
+                  "default": 0.3,
+                  "description": "Weight of the top-hit centroid"
+                },
+                "depth": {
+                  "type": "integer",
+                  "default": 3,
+                  "description": "Top hits forming the centroid"
+                }
+              }
+            },
+            "entityHop": {
+              "type": "boolean",
+              "default": true,
+              "description": "Graph-guided second pass: items linked to the top hits entities that the vector gate missed"
+            },
+            "queryCache": {
+              "type": "boolean",
+              "default": true,
+              "description": "Deterministic semantic cache for near-duplicate queries (anchor-bucketed, cosine-verified)"
+            }
+          }
+        },
+        "compression": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "triggerCount": {
+              "type": "integer",
+              "default": 200
+            },
+            "importanceThreshold": {
+              "type": "number",
+              "default": 0.35
+            },
+            "decayHalfLifeDays": {
+              "type": "number",
+              "default": 14
+            },
+            "eventRetentionDays": {
+              "type": "integer",
+              "default": 90,
+              "description": "Episodic events older than this are pruned during compression"
+            },
+            "tombstoneRetentionDays": {
+              "type": "integer",
+              "default": 7,
+              "description": "Tombstones older than this are hard-deleted during compression"
+            }
+          }
+        },
+        "graph": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "maxEntities": {
+              "type": "integer",
+              "default": 5000
+            },
+            "pagerankDamping": {
+              "type": "number",
+              "default": 0.85
+            },
+            "pagerankIterations": {
+              "type": "integer",
+              "default": 20
+            },
+            "pagerankEdgeDecayDays": {
+              "type": "number",
+              "default": 30,
+              "description": "Half-life (days) for edge-weight recency decay; 0 disables"
+            },
+            "personalizationWeight": {
+              "type": "number",
+              "default": 0.6,
+              "description": "Blend between global PageRank and query-personalized PPR (1 = pure PPR when query entities are known)"
+            }
+          }
+        },
+        "injection": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "maxTokens": {
+              "type": "integer",
+              "default": 2000
+            },
+            "systemPromptPrefix": {
+              "type": "string",
+              "default": "You have access to a long-term memory palace. When the user references past context, consult it via the memory_retrieve tool before answering."
+            },
+            "warmRanks": {
+              "type": "boolean",
+              "default": true,
+              "description": "Pre-warm personalized PageRank for the opening intent entities (local, free)"
+            }
+          }
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "user",
+            "workspace",
+            "session"
+          ],
+          "default": "user",
+          "description": "Home visibility tier for new memories; retrieval widens session→workspace→user→global and never crosses owner boundaries. memory_remember may override per item (visibility: global etc.). Anonymous callers see the global tier only."
+        }
+      }
+    }
+  }
+}

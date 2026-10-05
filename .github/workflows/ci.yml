@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck (lint)
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Tests
+        run: npm test
+      - name: Smoke the MCP server binary
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | MEMORY_PALACE_DB=/tmp/ci-palace.db node dist/bin/mcp-palace.js \
+            | tee /tmp/mcp-out.jsonl
+          grep -q 'memory_retrieve' /tmp/mcp-out.jsonl
+          grep -q 'memory_reflect' /tmp/mcp-out.jsonl

@@ -1,0 +1,75 @@
+{
+  "name": "@dsh-plugins/memory-palace",
+  "version": "0.7.1",
+  "description": "DSH Memory Palace - Layered long-term memory plugin for DeepSeek Harness. Episodic/semantic/procedural memory behind a four-tier visibility ACL; explainable SQL-pushdown cosine retrieval; time-decayed personalized PageRank; consensus synthesis; tombstoned right-to-be-forgotten; health observability; embedding failover; transactional two-phase ingest; TTL + retention lifecycle; access-refreshed decay; visibility-checked tools; SWR rank caches, Memory Capsules (inter-agent transport), reflection-based self-tuning, and an MCP stdio server; pseudo-relevance feedback, entity-hop recall expansion, as-of flashback queries, and a semantic query cache.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./services": {
+      "import": "./dist/services/index.js"
+    },
+    "./types": {
+      "import": "./dist/types/index.js"
+    },
+    "./mcp": {
+      "import": "./dist/mcp-server.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "agent",
+    "memory",
+    "rag",
+    "vector-store",
+    "long-term-memory"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --import tsx test/*.test.ts",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run verify",
+    "verify": "npm run lint && npm run build && npm test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-protocol": "^0.1.0",
+    "cordis": ">=0.6.0 <3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-protocol": {
+      "optional": true
+    }
+  },
+  "bin": {
+    "memory-palace-mcp": "./dist/bin/mcp-palace.js",
+    "palace-cli": "./dist/bin/palace-cli.js"
+  }
+}
