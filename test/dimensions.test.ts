@@ -26,6 +26,7 @@ import {
   reflectionGrid,
   objective,
 } from '../src/utils/reflection.ts';
+import { hash32 } from '../src/utils/embedding.ts';
 import { McpPalaceServer, MCP_PROTOCOL_VERSION } from '../src/mcp-server.ts';
 import type { ToolDefinition } from '../src/types/cordis.ts';
 
@@ -49,8 +50,114 @@ test('capsule ids are content-addressed and normalization-safe', () => {
     capsuleItemId('hello world again'),
     'whitespace collapse → same id',
   );
-  assert.match(capsuleItemId('some fact'), /^cap:[0-9a-f]{8}$/);
+  // D-02 eliminated: addressing is now a cryptographic CAS — 128-bit
+  // truncated SHA-256 — so every freshly minted id is 32 hex (legacy
+  // 8-hex / 16-hex ids still PARSE, but are never re-minted).
+  assert.match(capsuleItemId('some fact'), /^cap:[0-9a-f]{32}$/);
   assert.equal(normalizedContent(' a  b '), 'a b');
+});
+
+test('capsule ids: 128-bit surface separates last-character differences (D-02 regression)', () => {
+  // Cryptographic addressing (truncated SHA-256): one character of content
+  // change avalanches the digest — no FNV lane structure left to get
+  // unlucky on. 50% birthday bound is ~2^64 ≈ 1.8e19 items, and deliberate
+  // collisions are SHA-256-hard (untrusted cross-agent channel).
+  const a = capsuleItemId('the pipeline ships on tuesday version 7');
+  const b = capsuleItemId('the pipeline ships on tuesday version 8');
+  assert.match(a, /^cap:[0-9a-f]{32}$/);
+  assert.match(b, /^cap:[0-9a-f]{32}$/);
+  assert.notEqual(a, b, 'single-character content change yields a different id');
+  assert.notEqual(
+    a.slice(4, 20),
+    b.slice(4, 20),
+    'the digest prefix alone also separates them (avalanche, no legacy-id prefix carryover)',
+  );
+});
+
+test('capsule ids: legacy 32-bit capsules parse and stay importable (D-02 compat)', () => {
+  // Hand-mint a legacy id with the OLD single-round algorithm — an 8-hex
+  // id that no current code path produces anymore.
+  const content = 'legacy fact minted before the 64-bit widening';
+  const legacyId = `cap:${hash32(normalizedContent(content)).toString(16).padStart(8, '0')}`;
+  assert.match(legacyId, /^cap:[0-9a-f]{8}$/, 'sanity: hand-minted id is legacy-shaped');
+
+  const capsule: MemoryCapsule = {
+    magic: CAPSULE_MAGIC,
+    version: 1 as const,
+    palaceId: 'legacy-palace',
+    exportedAt: 1,
+    items: [
+      {
+        id: legacyId,
+        layer: 'semantic' as const,
+        content,
+        importance: 0.5,
+        createdAt: 1,
+        entities: [],
+        tags: [],
+        source: 'user' as const,
+      },
+    ],
+    patterns: [],
+  };
+  const parsed = parseCapsule(JSON.stringify(capsule));
+  assert.equal(parsed.items[0]!.id, legacyId, 'legacy id survives parse untouched');
+  assert.equal(parsed.legacyAddressCount, 1, 'v1 item is counted as a legacy address');
+
+  // Roundtrip: planImport/executeImport make no format assumption on ids
+  // (pass-through), so a legacy capsule is still importable end-to-end.
+  const plan = planImport(parsed, () => false, () => []);
+  assert.equal(plan.toInsert.length, 1, 'legacy capsule item is importable');
+  assert.equal(plan.toInsert[0]!.id, legacyId, 'planImport passes the legacy id through');
+});
+
+test('capsule ids: v2-era 16-hex capsules parse and stay importable (D-02 compat)', () => {
+  // Hand-mint a v2 id with the dual-round FNV algorithm — the addressing
+  // that 0.20.0 minted before the cryptographic CAS. The second round is
+  // re-derived HERE (independent re-implementation, frozen salt), so the
+  // test proves the algorithm rather than calling it.
+  const FNV2_SALT = 0x9e3779b9;
+  const fnv1a32Seeded = (s: string, seed: number): number => {
+    let h = seed >>> 0;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  };
+  const content = 'v2-era fact minted between the widening and the CAS';
+  const norm = normalizedContent(content);
+  const hi = hash32(norm);
+  const lo = fnv1a32Seeded(norm, (hi ^ FNV2_SALT) >>> 0);
+  const v2Id = `cap:${hi.toString(16).padStart(8, '0')}${lo.toString(16).padStart(8, '0')}`;
+  assert.match(v2Id, /^cap:[0-9a-f]{16}$/, 'sanity: hand-minted id is v2-shaped');
+
+  const capsule: MemoryCapsule = {
+    magic: CAPSULE_MAGIC,
+    version: 1 as const,
+    palaceId: 'v2-palace',
+    exportedAt: 1,
+    items: [
+      {
+        id: v2Id,
+        layer: 'semantic' as const,
+        content,
+        importance: 0.5,
+        createdAt: 1,
+        entities: [],
+        tags: [],
+        source: 'user' as const,
+      },
+    ],
+    patterns: [],
+  };
+  const parsed = parseCapsule(JSON.stringify(capsule));
+  assert.equal(parsed.items[0]!.id, v2Id, 'v2 id survives parse untouched');
+  assert.equal(parsed.legacyAddressCount, 1, 'v2 item is counted as a legacy address');
+
+  const plan = planImport(parsed, () => false, () => []);
+  assert.equal(plan.toInsert.length, 1, 'v2-era capsule item is importable');
+  assert.equal(plan.toInsert[0]!.id, v2Id, 'planImport passes the v2 id through');
 });
 
 test('capsule sign/verify roundtrip + tamper detection', () => {
@@ -110,7 +217,13 @@ test('parseCapsule validates magic, version, and content-addressing', () => {
     ...good,
     items: [{ ...good.items[0]!, id: 'cap:deadbeef' }],
   });
-  assert.throws(() => parseCapsule(badId), /id mismatch/);
+  // 'cap:deadbeef' is v1-SHAPED (8 hex) but does not recompute as a v1
+  // address of its content — three-generation verification names the
+  // generation it failed AND all three accepted formats plus the actual.
+  assert.throws(
+    () => parseCapsule(badId),
+    /id mismatch: id cap:deadbeef does not recompute for its content as a 8-hex v1 address.*accepted formats: cap:<8 hex \(v1 legacy\)> \| cap:<16 hex \(v2\)> \| cap:<32 hex \(v3 sha256\)>/,
+  );
 });
 
 test('planImport buckets duplicates, conflicts, and inserts', () => {
@@ -273,7 +386,9 @@ test('MCP handler: initialize, tools/list, tools/call, errors', async () => {
     method: 'tools/call',
     params: { name: 'nope', arguments: {} },
   });
-  assert.equal(unknownTool.error?.code, -32601);
+  // Unknown tool: the method exists, the NAME argument is invalid → -32602
+  // (invalid params), distinct from unknown methods below (-32601).
+  assert.equal(unknownTool.error?.code, -32602);
 
   const badMethod = await server.handle({ jsonrpc: '2.0', id: 5, method: 'resources/list' });
   assert.equal(badMethod.error?.code, -32601);

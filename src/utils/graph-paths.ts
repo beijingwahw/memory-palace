@@ -21,6 +21,11 @@ export function buildAdjacency(
     s.add(b);
   };
   for (const e of edges) {
+    // Self-loops are dropped, aligned with communities' D-13 policy
+    // (addEdge skips a===b): a self-loop's endpoints are trivially in the
+    // same cluster and at distance 0, so keeping x in its own neighbor
+    // table only inflates degree statistics without carrying information.
+    if (e.from === e.to) continue;
     link(e.from, e.to);
     link(e.to, e.from);
   }
@@ -44,8 +49,8 @@ export function shortestPath(
 
   const parentF = new Map<string, string>([[from, from]]);
   const parentB = new Map<string, string>([[to, to]]);
-  let frontierF = [from];
-  let frontierB = [to];
+  const frontierF = [from];
+  const frontierB = [to];
   let depthF = 0;
   let depthB = 0;
 
@@ -68,7 +73,7 @@ export function shortestPath(
     return null;
   };
 
-  while (true) {
+  for (;;) {
     // Alternate sides; expand the smaller frontier first. Guard BEFORE
     // expanding: the resulting path depth is (depth+1) + otherDepth.
     if (frontierF.length <= frontierB.length) {
@@ -94,16 +99,22 @@ function reconstruct(
 ): string[] {
   const head: string[] = [];
   let cur = meeting;
-  while (parentF.get(cur) !== cur) {
+  // Every walked node was assigned a parent by expand(); the root maps to
+  // itself, so the lookup never misses on this walk.
+  for (;;) {
+    const parent = parentF.get(cur);
+    if (parent === undefined || parent === cur) break;
     head.push(cur);
-    cur = parentF.get(cur)!;
+    cur = parent;
   }
   head.push(cur);
   head.reverse();
   const tail: string[] = [];
   cur = meeting;
-  while (parentB.get(cur) !== cur) {
-    cur = parentB.get(cur)!;
+  for (;;) {
+    const parent = parentB.get(cur);
+    if (parent === undefined || parent === cur) break;
+    cur = parent;
     tail.push(cur);
   }
   return [...head, ...tail];

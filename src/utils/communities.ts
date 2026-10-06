@@ -108,9 +108,16 @@ export function labelPropagation(
   for (const [node, label] of labels) finalLabels.set(node, canonical.get(label) ?? 0);
 
   // Cohesion: share of total edge weight whose endpoints share a label.
+  // Self-loops are skipped under the same policy as the adjacency build
+  // above (addEdge drops a===b): a self-loop's endpoints trivially share
+  // a label, so counting it would inflate both `intra` and `total` toward
+  // 1 and make cohesion look artificially high on self-looping input.
+  // Upstream callers currently never emit self-loops — this is defensive
+  // consistency, not a behavior change for them.
   let intra = 0;
   let total = 0;
   for (const e of edges) {
+    if (e.a === e.b) continue;
     total += e.weight;
     if (finalLabels.get(e.a) === finalLabels.get(e.b)) intra += e.weight;
   }

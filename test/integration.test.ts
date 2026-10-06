@@ -9,7 +9,7 @@
  *  - graph extracts entities; PageRank mass is conserved
  *  - compression removes low-importance items
  *  - scope filtering isolates users' memories
- *  - the five model tools register and run
+ *  - the fifteen model tools register and run
  *  - lifecycle events flow through the bus to the kernel
  *
  * Every subtest installs the plugin against its OWN throwaway database
@@ -51,11 +51,13 @@ test('Memory Palace end-to-end', async (t) => {
    * before freshDb() registers the directory removal (close → rm).
    */
   const install = (t: AfterHooks, opts: Record<string, unknown> = {}) => {
-    let ctx: ReturnType<typeof createMockContext> | undefined;
+    // Hook ORDER is the whole game on Windows: the store close must be
+    // registered BEFORE freshDb's tmpdir rm (hooks run in registration
+    // order), or rmSync hits the open WAL handle (EPERM). ctx is created
+    // up front so the close hook can capture it directly.
+    const ctx = createMockContext();
     t.after(() => {
-      const store = ctx?.services.get('memory-store') as
-        | { close(): void }
-        | undefined;
+      const store = ctx.services.get('memory-store') as { close(): void } | undefined;
       try {
         store?.close();
       } catch {
@@ -63,7 +65,6 @@ test('Memory Palace end-to-end', async (t) => {
       }
     });
     const dbPath = freshDb(t);
-    ctx = createMockContext();
     MemoryPalacePlugin(ctx as never, {
       storagePath: dbPath,
       embedding: { provider: 'offline-bm25', model: 'bm25', dimensions: 256 },
@@ -105,9 +106,11 @@ test('Memory Palace end-to-end', async (t) => {
     assert.ok(result.semanticIds.length > 0, 'at least one semantic item created');
 
     const stats = palace.store.stats();
-    assert.ok(stats.items.episodic >= 0);
-    assert.ok(stats.items.semantic > 0, 'semantic items stored');
+    // The episodic footprint of an ingested message is the episodic_event
+    // row (memory items are semantic-layer), so the episodic count to
+    // assert is stats.events — items.episodic stays 0 by design.
     assert.ok(stats.events >= 1, 'episodic event stored');
+    assert.ok(stats.items.semantic >= 1, 'semantic items stored');
     // Every item must be space-tagged for multi-space retrieval.
     assert.ok(Object.keys(stats.spaces).length >= 1, 'embedding spaces reported');
   });
@@ -116,17 +119,23 @@ test('Memory Palace end-to-end', async (t) => {
     const ctx = install(t);
     const palace = ctx.services.get('memory-palace') as any;
 
+    // New-semantics note (post-audit round): message→semantic candidacy is
+    // now token-gated (chunker minTokens=16 — the old 82-char sentence
+    // counted ~15 tokens and produced NO semantic item), and writes resolve
+    // privacy-first to the narrowest owned tier (a message carrying a
+    // sessionId lands at session tier). Content lengthened past the gate
+    // and the retrieval carries the same session — intent unchanged.
     await palace.ingestor.ingestMessage({
       role: 'user',
       content:
-        'Project Phoenix uses PostgreSQL 16 with pgvector for similarity search. The API lives at github.com/acme/phoenix.',
+        'Project Phoenix uses PostgreSQL 16 with pgvector for similarity search in production, and the API lives at github.com/acme/phoenix with full documentation in the team wiki.',
       sessionId: 'sess-2',
       userId: 'u-1',
     });
     await palace.ingestor.ingestMessage({
       role: 'assistant',
       content:
-        'Understood. I will use Postgres 16 with pgvector for the vector store and reference the github.com/acme/phoenix repo for context.',
+        'Understood. I will use Postgres 16 with pgvector for the vector store and reference the github.com/acme/phoenix repo for context, and I will keep the deployment notes updated in the wiki.',
       sessionId: 'sess-2',
       userId: 'u-1',
     });
@@ -134,7 +143,7 @@ test('Memory Palace end-to-end', async (t) => {
     const result = await palace.retriever.retrieve({
       query: 'How do we deploy Phoenix?',
       topK: 5,
-      scope: { userId: 'u-1' },
+      scope: { userId: 'u-1', sessionId: 'sess-2' },
     });
     assert.ok(result.hits.length > 0, 'retrieval produced hits');
     assert.ok(result.totalTokens > 0, 'token budget counted');
@@ -297,7 +306,7 @@ test('Memory Palace end-to-end', async (t) => {
     const ctx = install(t);
     const palace = ctx.services.get('memory-palace') as any;
 
-    assert.equal(ctx.tools.length, 8, 'eight tools registered');
+    assert.equal(ctx.tools.length, 15, 'fifteen tools registered');
     const byName = new Map(ctx.tools.map((tool: any) => [tool.name, tool]));
     for (const name of [
       'memory_retrieve',
@@ -394,7 +403,6 @@ test('Memory Palace end-to-end', async (t) => {
 
   await t.test('retrieve understands temporal queries and synthesizes consensus', async (t) => {
     const ctx = install(t);
-    const palace = ctx.services.get('memory-palace') as any;
     const byName = new Map(ctx.tools.map((tool: any) => [tool.name, tool]));
     const retrieve = byName.get('memory_retrieve');
     const remember = byName.get('memory_remember');
@@ -541,14 +549,19 @@ test('Memory Palace end-to-end', async (t) => {
     const byName = new Map(ctx.tools.map((tool: any) => [tool.name, tool]));
     const remember = byName.get('memory_remember');
 
+    // New-semantics note (post-audit round): write tiers resolve
+    // privacy-first — an identified caller's explicit `visibility: 'global'`
+    // collapses to their narrowest owned tier, so a genuinely shared row is
+    // minted from an ANONYMOUS context. The user-tier write keeps its
+    // owner. Test intent (shared vs private tier) unchanged.
     await remember.run(
       { content: 'Team holiday calendar lives at calendar.example.com.', visibility: 'global' },
-      { sessionId: 's1', userId: 'u-one' },
+      {},
     );
     await remember.run(
       { content: 'SecretProject codename is FalconHeavy.',
        visibility: 'user' },
-      { sessionId: 's1', userId: 'u-one' },
+      { userId: 'u-one' },
     );
 
     const asOther = await palace.retriever.retrieve({
@@ -622,7 +635,6 @@ test('Memory Palace end-to-end', async (t) => {
 
   await t.test('as-of flashback reconstructs superseded beliefs', async (t) => {
     const ctx = install(t, { scope: 'user' });
-    const palace = ctx.services.get('memory-palace') as any;
     const byName = new Map(ctx.tools.map((tool: any) => [tool.name, tool]));
     const remember = byName.get('memory_remember');
     const retrieve = byName.get('memory_retrieve');
@@ -768,7 +780,11 @@ test('Memory Palace end-to-end', async (t) => {
 
     const found = await palaceB.retriever.retrieve({
       query: 'Helios mesh Envoy traffic routing',
-      scope: { userId: 'u-b' },
+      // New-semantics note (post-audit round): capsule imports resolve
+      // their tier privacy-first through the IMPORTER's scope — importing
+      // from a session-bearing tool context lands the items at that
+      // session tier, so the follow-up read carries the same session.
+      scope: { userId: 'u-b', sessionId: 's' },
     });
     assert.ok(
       found.hits.some((h: any) => /Envoy/.test(h.item.content)),
@@ -813,5 +829,52 @@ test('Memory Palace end-to-end', async (t) => {
     const names = new Set(ctx.emittedEvents.map((e) => e.name));
     assert.ok(names.has('memory.before-retrieve'), 'before-retrieve emitted');
     assert.ok(names.has('memory.after-retrieve'), 'after-retrieve emitted');
+  });
+
+  await t.test('facade.remember writes with explicit identity', async (t) => {
+    const ctx = install(t, { scope: 'user' });
+    const palace = ctx.services.get('memory-palace') as any;
+
+    // The facade used to offer no identity on writes at all (everything
+    // went down the anonymous write-policy path); the scoped opt is the
+    // write-side mirror of facade.retrieve's scope shape.
+    const id = await palace.remember(
+      'FacadeUser rotates the staging credentials every Friday afternoon.',
+      { userId: 'u-facade' },
+    );
+    assert.ok(id, 'facade.remember returns the stored item id');
+
+    const row = palace.store.getItem(id);
+    assert.ok(row, 'stored row readable through the facade store');
+    assert.equal(row.visibility, 'user', 'visibility tier resolves to user');
+    assert.equal(row.userId, 'u-facade', 'owner column carries the explicit identity');
+  });
+
+  await t.test('stratify runs with graph-wired hot entities', async (t) => {
+    const ctx = install(t, { scope: 'user' });
+    const palace = ctx.services.get('memory-palace') as any;
+
+    // One entity (Aurora) mentioned many times so the graph accumulates
+    // rank mass — the wiring under test consults those ranks during
+    // stratification. The SAME session id rides into stratify so the
+    // widest cumulative level covers the (session-tier) semantic item the
+    // message produced. Deliberately weak assertion: the point is that
+    // the newly wired hot-entity path does not crash and nodes still
+    // build, not that the +0.15 salience boost moves any specific line.
+    await palace.ingestor.ingestMessage({
+      role: 'user',
+      content:
+        'Aurora update: the Aurora cluster now replicates to the Aurora standby in eu-west. ' +
+        'The Aurora cutover follows the Aurora health checks, and the Aurora rollback plan ' +
+        'was signed off by the Aurora owners this morning.',
+      sessionId: 'sess-strat',
+      userId: 'u-strat',
+    });
+
+    const report = await palace.stratifier.stratify({
+      userId: 'u-strat',
+      sessionId: 'sess-strat',
+    });
+    assert.ok(report.nodesBuilt >= 1, 'stratify builds nodes through the wired graph path');
   });
 });

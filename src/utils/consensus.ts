@@ -7,9 +7,14 @@
  * a stale fact. This module clusters retrieval hits and grades each
  * cluster:
  *
- *   - corroboration: items mutually similar (embedding cosine, or token
- *     Jaccard when embeddings are absent) merge into one cluster; the
- *     more independent-ish members, the higher `agreement`.
+ *   - corroboration: each item joins the cluster whose SEED (its
+ *     highest-scored member) it is most similar to (embedding cosine, or
+ *     token Jaccard when embeddings are absent or dimension-mismatched); the
+ *     more members a
+ *     cluster gathers, the higher `agreement`. Note this is greedy
+ *     seed-similarity clustering, NOT full mutual similarity — two
+ *     members of one cluster are each similar to the seed but not
+ *     necessarily to each other.
  *   - contradiction: within a cluster, numeric signatures that diverge
  *     ("PostgreSQL 15" vs "…16…") or negation-polarity flips ("we use
  *     X" vs "we don't use X") mark the cluster conflicted with a reason.
@@ -50,7 +55,7 @@ export interface ConsensusOptions {
   similarityThreshold?: number;
 }
 
-/** Cluster hits greedily by mutual similarity, best-scored seeds first. */
+/** Cluster hits greedily by seed similarity, best-scored seeds first. */
 export function clusterByConsensus<T extends ConsensusInput>(
   items: T[],
   opts: ConsensusOptions = {},
@@ -63,15 +68,21 @@ export function clusterByConsensus<T extends ConsensusInput>(
     let bestIdx = -1;
     let bestSim = 0;
     for (let i = 0; i < clusters.length; i++) {
-      const sim = similarity(item, clusters[i].seed);
+      const cl = clusters[i];
+      // i < clusters.length pins the slot; the guard never fires.
+      if (cl === undefined) continue;
+      const sim = similarity(item, cl.seed);
       if (sim >= threshold && sim > bestSim) {
         bestSim = sim;
         bestIdx = i;
       }
     }
     if (bestIdx >= 0) {
-      clusters[bestIdx].members.push(item);
-      clusters[bestIdx].sims.push(bestSim);
+      const best = clusters[bestIdx];
+      if (best) {
+        best.members.push(item);
+        best.sims.push(bestSim);
+      }
     } else {
       clusters.push({ seed: item, members: [item], sims: [] });
     }
@@ -87,18 +98,33 @@ export function clusterByConsensus<T extends ConsensusInput>(
       1,
       (0.35 + 0.25 * (c.members.length - 1)) * (0.6 + 0.4 * avgSim),
     );
-    const rep = c.members[0]; // ordered by score desc
+    // members[0] is the seed the cluster was created with.
+    const rep = c.members[0] ?? c.seed;
     let conflict = false;
     let conflictReason: string | undefined;
-    for (const other of c.members.slice(1)) {
-      const det = detectConflict(rep, other);
-      if (det.conflict) {
-        conflict = true;
-        conflictReason = det.reason;
-        break;
+    // Full pairwise scan (not just rep-vs-member): two members can be
+    // mutually incompatible while each is individually compatible with
+    // the representative — that conflict must not slip through.
+    for (let i = 0; i < c.members.length && !conflict; i++) {
+      const a = c.members[i];
+      if (a === undefined) continue;
+      for (let j = i + 1; j < c.members.length && !conflict; j++) {
+        const b = c.members[j];
+        if (b === undefined) continue;
+        const det = detectConflict(a, b);
+        if (det.conflict) {
+          conflict = true;
+          conflictReason = det.reason; // first conflicting pair wins
+        }
       }
     }
-    return { members: c.members, agreement, conflict, conflictReason, representative: rep };
+    return {
+      members: c.members,
+      agreement,
+      conflict,
+      ...(conflictReason !== undefined ? { conflictReason } : {}),
+      representative: rep,
+    };
   });
 }
 
@@ -123,11 +149,21 @@ export function detectConflict(
   return { conflict: false };
 }
 
-/** Similarity: embedding cosine when both exist, else token Jaccard. */
+/**
+ * Similarity: embedding cosine when BOTH sides carry embeddings of EQUAL
+ * dimension; everything else — either embedding missing, or the two living
+ * in different-dimensional spaces — degrades to token Jaccard over content.
+ */
 export function similarity(a: ConsensusInput, b: ConsensusInput): number {
-  if (a.embedding && b.embedding) {
+  if (a.embedding && b.embedding && a.embedding.length === b.embedding.length) {
     return cosine(a.embedding, b.embedding);
   }
+  // Dimension-mismatched vector pairs are incomparable in any embedding
+  // sense, yet cosine() scores them a flat 0 — declaring "maximally
+  // different" about two texts that may be near-duplicates from different
+  // spaces is misreporting, not caution. Degrade to the token-Jaccard
+  // path instead, aligned with fed-merge pairSimilarity's cross-space
+  // fallback discipline.
   const ta = new Set(tokenize(a.content));
   const tb = new Set(tokenize(b.content));
   if (ta.size === 0 || tb.size === 0) return 0;
@@ -150,18 +186,22 @@ export function similarity(a: ConsensusInput, b: ConsensusInput): number {
  *   1. dates — ISO date/datetime (`2024-01-15`, `2024-1-5`, optionally with
  *      a `T`/space time part) and slash dates (`1/5/24`, `01/05/2024`),
  *      recorded as ONE atomic entry per date, normalized by zero-padding
- *      month/day (so `2024-1-5` == `2024-01-05`);
- *   2. versions — `v1.2`, `1.2.3` style tokens as atomic entries (leading
- *      `v` stripped so `v1.2.3` == `1.2.3`);
- *   3. plain integers/decimals from whatever text remains.
+ *      month/day (so `2024-1-5` == `2024-01-05`) and expanding two-digit
+ *      years to the 2000 tier (so `1/5/24` == `01/05/2024`);
+ *   2. versions — three-part `1.2.3` (optional leading `v`) and explicit-v
+ *      two-part `v1.2` tokens as atomic entries (leading `v` stripped so
+ *      `v1.2.3` == `1.2.3`); bare two-part decimals like `3.5` (as in
+ *      "3.5 GB") are NOT versions and fall through to plain numbers;
+ *   3. plain integers/decimals from whatever text remains, normalized by
+ *      numeric value (so `1.20` == `1.2` and `015` == `15`).
  */
 
 /** ISO date or datetime: `2024-01-15`, `2024-1-5`, `2024-01-15T09:30:00`. */
 const ISO_DATE_RE = /\d{4}-\d{1,2}-\d{1,2}([T ]\d{1,2}:\d{2}(:\d{2})?)?/g;
 /** Slash date: `1/5/24`, `01/05/2024` (month/day/year). */
 const SLASH_DATE_RE = /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g;
-/** Version-ish token: `v1.2`, `1.2.3`, `16.4`. */
-const VERSION_RE = /\bv?\d+\.\d+(\.\d+)?\b/g;
+/** Version token: three-part `1.2.3`/`v1.2.3`, or explicit-v two-part `v1.2`. */
+const VERSION_RE = /\bv?\d+\.\d+\.\d+\b|\bv\d+\.\d+\b/g;
 /** Plain integer/decimal on the remaining (date/version-stripped) text. */
 const NUM_RE = /\d+(?:\.\d+)?/g;
 
@@ -183,18 +223,27 @@ function normalizeIsoDate(m: string): string {
       .exec(m);
   if (!g) return m;
   const [, y, mo, d, , h, mi, s] = g;
+  // Unmatched groups fall back to the same passthrough as a non-match.
+  if (y === undefined || mo === undefined || d === undefined) return m;
   let out = `${y}-${pad2(mo)}-${pad2(d)}`;
-  if (h !== undefined) {
+  // h and mi sit inside the same optional group, so they match together.
+  if (h !== undefined && mi !== undefined) {
     out += `T${pad2(h)}:${mi}${s !== undefined ? `:${s}` : ''}`;
   }
   return out;
 }
 
-/** `1/5/24` → `01/05/24` (year kept as written; only month/day padded). */
+/** `1/5/24` → `01/05/2024` (two-digit years expand to the 2000 tier). */
 function normalizeSlashDate(m: string): string {
   const g = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/.exec(m);
   if (!g) return m;
-  return `${pad2(g[1])}/${pad2(g[2])}/${g[3]}`;
+  const [, mm, dd, yy] = g;
+  if (mm === undefined || dd === undefined || yy === undefined) return m;
+  const year =
+    yy.length === 2
+      ? String(Math.min(2099, Math.max(2000, 2000 + Number(yy))))
+      : yy;
+  return `${pad2(mm)}/${pad2(dd)}/${year}`;
 }
 
 /**
@@ -222,7 +271,8 @@ export function signaturesOf(content: string): NumericSignatureUnits {
     });
 
   const rest = masked.match(NUM_RE);
-  if (rest) for (const n of rest) numbers.push(n);
+  // Normalize by numeric value so "1.20" == "1.2" and "015" == "15".
+  if (rest) for (const n of rest) numbers.push(String(Number(n)));
 
   return {
     dates: [...new Set(dates)],
@@ -237,10 +287,25 @@ export function numericSignature(content: string): string[] {
   return [...new Set([...dates, ...versions, ...numbers])];
 }
 
-const EN_NEGATIONS = new Set([
-  'not', 'no', 'never', 'none', 'cannot', "don't", 'dont', "doesn't",
-  'doesnt', "isn't", 'isnt', "won't", 'wont', 'without', 'avoid',
-]);
+/**
+ * English negations, counted on the RAW lowercased text rather than on
+ * tokenize() output: the tokenizer splits contractions at the apostrophe
+ * ("don't" → "don" + "t"), so contracted forms never matched a token-set
+ * lookup. The regex sees "don't", "dont" and "DON'T" alike.
+ *
+ * Branch union: the keyword branch (\bnot\b etc.) can never fire inside
+ * "cannot" ('not' there has no word boundary), so "cannot" needs its own
+ * \bcannot\b branch; conversely the contraction branch never matches it
+ * ("cannot" is not "can" + optional apostrophe + "t"). Together they are
+ * complete — each English negation form is consumed by exactly one
+ * branch, no double counting. The contraction alternation covers every
+ * standard n't contraction (don/doesn/isn/wasn/aren/weren/won/can/
+ * couldn/shouldn/wouldn/hasn/haven/didn/mustn/needn/shan/ain), all
+ * requiring the final "t" so bare affirmative words ("can", "won" the
+ * past tense of win) never match.
+ */
+const EN_NEGATION_RE =
+  /\b(?:not|never|no|none|neither|nor)\b|\bcannot\b|(?:don|doesn|isn|wasn|aren|weren|won|can|couldn|shouldn|wouldn|hasn|haven|didn|mustn|needn|shan|ain)'?t/g;
 
 /**
  * Two-char Chinese idioms that CONTAIN 不 (or similar) but are affirmative:
@@ -293,11 +358,8 @@ export function cnNegationCount(content: string): number {
 
 /** Even = affirmative, odd = negated (double negation cancels). */
 export function negationPolarity(content: string): number {
-  let count = 0;
-  for (const tok of tokenize(content)) {
-    if (EN_NEGATIONS.has(tok)) count++;
-  }
-  count += cnNegationCount(content);
+  const en = content.toLowerCase().match(EN_NEGATION_RE);
+  const count = (en ? en.length : 0) + cnNegationCount(content);
   return count % 2;
 }
 

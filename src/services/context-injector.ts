@@ -16,6 +16,7 @@
 import { approximateTokenCount, truncateToTokens } from '../utils/tokenizer.js';
 import { scopeLevels, widestLevel } from '../utils/scope.js';
 import type { MemoryRetriever } from './memory-retriever.js';
+import type { CoreMemoryService } from './core-memory.js';
 import type { MemoryGraph } from './memory-graph.js';
 import type { MemoryStore } from './memory-store.js';
 import type { MemoryItem, MemoryScopeKind } from '../types/index.js';
@@ -26,6 +27,8 @@ export interface InjectionConfig {
   systemPromptPrefix: string;
   /** Pre-warm personalized PageRank for the intent's entities (local, free). */
   warmRanks?: boolean;
+  /** Fraction of the budget reserved for the core SELF (0 disables). Default 1/3. */
+  coreBudgetFraction?: number;
 }
 
 export interface InjectionInput {
@@ -53,10 +56,21 @@ export class ContextInjector {
     private store: MemoryStore,
     private cfg: InjectionConfig,
     private scopeKind: MemoryScopeKind = 'user',
+    private core?: CoreMemoryService,
   ) {}
 
   async inject(input: InjectionInput): Promise<InjectionOutput> {
-    if (!this.cfg.enabled) {
+    // A non-positive budget can only produce an empty (or negative-
+    // budgeted) injection — bail before any retrieval/store work. The
+    // Number.isFinite guard matters because NaN passes `<= 0` yet poisons
+    // EVERY downstream comparison (`cost > NaN` is false → nothing is ever
+    // budget-checked, and the block grows unbounded before a nonsense
+    // truncation). Non-finite budgets are config bugs: emit nothing.
+    if (
+      !this.cfg.enabled ||
+      !Number.isFinite(this.cfg.maxTokens) ||
+      this.cfg.maxTokens <= 0
+    ) {
       return {
         systemPromptAddition: '',
         contextBlock: '',
@@ -69,6 +83,24 @@ export class ContextInjector {
 
     const budget = this.cfg.maxTokens;
 
+    // 0. The SELF first: core blocks are tiny, always-on identity — they
+    //    get up to a bounded fraction of the budget BEFORE retrieval so a
+    //    cold start opens with who the user is, not with what ranked well.
+    const coreFraction = this.cfg.coreBudgetFraction ?? 1 / 3;
+    let coreBlock = '';
+    let coreTokens = 0;
+    if (this.core && coreFraction > 0) {
+      coreBlock = this.core.formatForPrompt(
+        {
+          ...(input.userId !== undefined ? { userId: input.userId } : {}),
+          ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
+          sessionId: input.sessionId,
+        },
+        Math.floor(budget * coreFraction),
+      );
+      coreTokens = coreBlock ? approximateTokenCount(coreBlock) : 0;
+    }
+
     // 1. Retrieval, scoped to the caller
     const retrieval = await this.retriever.retrieve({
       query: input.intent,
@@ -76,8 +108,8 @@ export class ContextInjector {
       layers: ['semantic', 'procedural'],
       scope: {
         sessionId: input.sessionId,
-        workspaceId: input.workspaceId,
-        userId: input.userId,
+        ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
+        ...(input.userId !== undefined ? { userId: input.userId } : {}),
       },
     });
 
@@ -87,20 +119,24 @@ export class ContextInjector {
     //    user's mined preferences never leak into another's context.
     const level = widestLevel(
       scopeLevels(this.scopeKind, {
-        userId: input.userId,
-        workspaceId: input.workspaceId,
+        ...(input.userId !== undefined ? { userId: input.userId } : {}),
+        ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
         sessionId: input.sessionId,
       }),
     );
     const patterns = this.store.listPatternsScoped(level).slice(0, 5);
     const patternLines: string[] = [];
-    let patternTokens = 0;
+    // Shared "extras" budget bucket: the procedural pattern lines AND the
+    // graph subgraph block both draw from (and are charged against) this
+    // one accumulator — patterns were its first tenant, hence the bucket's
+    // budget/4 gate below, but it is not patterns-only.
+    let extrasTokens = 0;
     for (const p of patterns) {
       const line = `- ${p.pattern} (confidence ${(p.confidence * 100).toFixed(0)}%): ${p.description}`;
       const cost = approximateTokenCount(line);
-      if (patternTokens + cost > budget / 4) break;
+      if (extrasTokens + cost > budget / 4) break;
       patternLines.push(line);
-      patternTokens += cost;
+      extrasTokens += cost;
     }
 
     // 3. Subgraph around the PageRank-leading entity of the retrieved
@@ -128,26 +164,38 @@ export class ContextInjector {
       level,
     );
     if (leadEntityId) {
+      // By-id lookup: every scoped store read is by NAME, and the id was
+      // itself produced by topRankedEntity over this caller's scoped rank
+      // table (the ACL was applied upstream), so no scoped equivalent of
+      // getEntity exists to migrate to.
+      // eslint-disable-next-line @typescript-eslint/no-deprecated -- id-keyed read of an id the scoped ranking itself surfaced
       const ent = this.store.getEntity(leadEntityId);
       if (ent) {
         const desc = this.graph.describeSubgraph(ent.name, 1, 12, level);
         if (desc) {
           const cost = approximateTokenCount(desc);
-          if (patternTokens + cost < budget / 2) {
+          // The graph block shares the SAME budget the core SELF already
+          // drew from — and lands in the shared extras bucket alongside
+          // the pattern lines. Charge coreTokens + extrasTokens here, or a
+          // large core block plus a full-size subgraph silently overdraws
+          // the injection.
+          if (coreTokens + extrasTokens + cost < budget / 2) {
             graphBlock = desc;
             leadEntity = ent.name;
-            patternTokens += cost;
+            extrasTokens += cost;
           }
         }
       }
     }
 
-    // 4. Memory context block
+    // 4. Memory context block — gets whatever the core SELF and the
+    // shared extras bucket (patterns + graph subgraph) left of the budget.
     const contextBlock = this.retriever.formatAsContext(
       retrieval,
-      budget - patternTokens - 50,
+      budget - coreTokens - extrasTokens - 50,
     );
     const finalBlock = [
+      coreBlock,
       graphBlock,
       patternLines.join('\n'),
       contextBlock,
@@ -164,7 +212,9 @@ export class ContextInjector {
       systemPromptAddition: promptAddition,
       contextBlock: truncated,
       retrievedItemIds: retrieval.hits.map((h) => h.item.id),
-      proceduralPatterns: patterns.map((p) => p.pattern),
+      // Report exactly the lines that MADE IT INTO the block — not the
+      // full fetched set, which may have been budget-truncated above.
+      proceduralPatterns: patternLines,
       leadEntity,
       budgetUsed: approximateTokenCount(promptAddition),
     };

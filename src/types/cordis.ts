@@ -17,7 +17,7 @@ export interface CordisContext {
     error(msg: string): void;
     debug(msg: string): void;
   };
-  service<T = unknown>(name: string, value: T): void;
+  service(name: string, value: unknown): void;
   on(
     event: string,
     handler: (event: CordisEvent) => Promise<void> | void,
@@ -63,5 +63,5 @@ export interface ToolDefinition<I = unknown, O = unknown> {
   };
   /** JSON Schema for the output object (documentation / validation). */
   returns?: Record<string, unknown>;
-  run(input: I, ctx: ToolContext): Promise<O>;
+  run(input: I, ctx: ToolContext): Promise<O> | O;
 }

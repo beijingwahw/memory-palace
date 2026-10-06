@@ -13,6 +13,7 @@
  */
 
 import { cosine } from './embedding.js';
+import { invariant } from './invariants.js';
 
 /** Gini coefficient over non-negative values (0 perfect equality … 1). */
 export function gini(values: number[]): number {
@@ -23,7 +24,10 @@ export function gini(values: number[]): number {
   if (sum <= 0) return 0;
   // cumulative form: G = (2Σ i·x_i) / (n·Σx) − (n+1)/n
   let weighted = 0;
-  for (let i = 0; i < n; i++) weighted += (i + 1) * v[i];
+  for (let i = 0; i < n; i++) {
+    const x = v[i];
+    if (x !== undefined) weighted += (i + 1) * x; // i < n = v.length
+  }
   return Math.max(0, Math.min(1, (2 * weighted) / (n * sum) - (n + 1) / n));
 }
 
@@ -38,8 +42,12 @@ export function quantile(values: number[], q: number): number {
   const pos = (v.length - 1) * Math.min(1, Math.max(0, q));
   const lo = Math.floor(pos);
   const hi = Math.ceil(pos);
-  if (lo === hi) return v[lo];
-  return v[lo] + (v[hi] - v[lo]) * (pos - lo);
+  const vlo = v[lo];
+  const vhi = v[hi];
+  // pos ∈ [0, v.length − 1] bounds both floor and ceil indices in range.
+  invariant(vlo !== undefined && vhi !== undefined, 'quantile(): pos bounds lo/hi in range');
+  if (lo === hi) return vlo;
+  return vlo + (vhi - vlo) * (pos - lo);
 }
 
 export interface DuplicationOptions {
@@ -71,7 +79,9 @@ export function duplicationRatio(
     for (let j = i + 1; j < n; j++) {
       if (k % stride === 0) {
         examined++;
-        if (cosine(vectors[i], vectors[j]) >= threshold) clones++;
+        const a = vectors[i];
+        const b = vectors[j];
+        if (a !== undefined && b !== undefined && cosine(a, b) >= threshold) clones++;
       }
       k++;
     }

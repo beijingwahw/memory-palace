@@ -31,6 +31,7 @@
  */
 
 import { CircuitBreaker } from './circuit-breaker.js';
+import { invariant } from './invariants.js';
 import { tokenize } from './tokenizer.js';
 
 export interface EmbeddingProvider {
@@ -90,13 +91,17 @@ export class DeepSeekEmbeddingProvider implements EmbeddingProvider {
     this.model = opts.model ?? 'deepseek-embed';
     this.baseUrl = (opts.baseUrl ?? 'https://api.deepseek.com').replace(/\/$/, '');
     this.timeoutMs = opts.timeoutMs ?? 15_000;
-    this.dimensions = 1024; // deepseek-embed default; overridden by API response
+    this.dimensions = 1024; // deepseek-embed default
     this.space = `deepseek:${this.model}`;
   }
 
   async embed(text: string): Promise<Float32Array> {
     const res = await this.call([text]);
-    return res[0];
+    const first = res[0];
+    // call() enforces the batch contract (one vector per input text), so a
+    // single-text request always yields exactly one vector.
+    invariant(first !== undefined, 'embed(): call() returned no vector for a single-text batch');
+    return first;
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
@@ -134,9 +139,27 @@ export class DeepSeekEmbeddingProvider implements EmbeddingProvider {
       data: { embedding: number[]; index: number }[];
       model: string;
     };
+    // Batch contract: one vector per input, in input order (indexed). A
+    // short/overlong response would silently misalign vectors with texts
+    // downstream — fail HERE with a descriptive error instead of letting
+    // a generic batch-contract mismatch surface from the callers.
+    if (json.data.length !== input.length) {
+      throw new Error(
+        `DeepSeek embedding batch mismatch: sent ${input.length} text(s), ` +
+          `received ${json.data.length} vector(s) (model ${json.model || this.model})`,
+      );
+    }
     return json.data
       .sort((a, b) => a.index - b.index)
       .map((d) => {
+        // A gateway/model swap that silently changes the vector width
+        // would mislabel every stored row — fail loudly instead.
+        if (d.embedding.length !== this.dimensions) {
+          throw new Error(
+            `DeepSeek embedding dimension mismatch: expected ${this.dimensions}, ` +
+              `got ${d.embedding.length} (model ${json.model || this.model})`,
+          );
+        }
         const arr = new Float32Array(d.embedding);
         normalizeInPlace(arr);
         return arr;
@@ -179,11 +202,26 @@ export class OfflineBM25EmbeddingProvider implements EmbeddingProvider {
   readonly space: string;
 
   constructor(dimensions = 1024) {
+    // A non-positive or fractional dimension fails LOUDLY here: dims = 0
+    // silently produced all-zero vectors for every text (hash % 0 = NaN
+    // index → nothing ever written), and dims = 1024.5 truncated modulo a
+    // half-open range, dropping roughly half the tokens' buckets. Both
+    // corrupted retrieval with zero symptoms downstream.
+    if (!Number.isInteger(dimensions) || dimensions < 1) {
+      throw new Error(
+        `OfflineBM25EmbeddingProvider: dimensions must be a positive integer, got ${dimensions}`,
+      );
+    }
     this.dimensions = dimensions;
     this.space = `offline-bm25:${dimensions}`;
   }
 
-  async embed(text: string): Promise<Float32Array> {
+  embed(text: string): Promise<Float32Array> {
+    return Promise.resolve(this.computeVector(text));
+  }
+
+  /** Synchronous sparse-hash vector (no I/O — the whole point). */
+  private computeVector(text: string): Float32Array {
     const v = new Float32Array(this.dimensions);
     const toks = tokenize(text);
     if (toks.length === 0) return v;
@@ -191,8 +229,10 @@ export class OfflineBM25EmbeddingProvider implements EmbeddingProvider {
     for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1);
     for (const [tok, count] of tf) {
       const idx = hash32(tok) % this.dimensions;
-      // sublinear TF: 1 + log(count)
-      v[idx] += 1 + Math.log(count);
+      // sublinear TF: 1 + log(count). idx < dimensions by construction
+      // (hash32 returns uint32, dimensions is a positive integer).
+      const cur = v[idx];
+      if (cur !== undefined) v[idx] = cur + 1 + Math.log(count);
     }
     normalizeInPlace(v);
     return v;
@@ -245,14 +285,21 @@ export class ResilientEmbeddingProvider implements EmbeddingGateway {
      * closed→open (degraded, offline vectors now serve), open→half-open
      * (probe going out), half-open→open (probe failed), half-open→closed
      * (recovered). Wired into the gateway's own breaker; when a custom
-     * breaker is injected, attach its onTransition at its construction.
+     * breaker is injected together with this callback, the callback is
+     * attached to that breaker via addObserver instead of dropped.
      */
     onStateChange?: (from: string, to: string) => void,
   ) {
     this.name = `${primary.name}+fallback`;
-    this.dimensions = fallback.dimensions; // offline layout drives storage size
+    // Gateway metadata reflects the PRIMARY space: `space` above names it
+    // and dimensions should describe its width. The fallback's vectors
+    // carry their own space tag and are never compared across spaces, so
+    // the fallback's (possibly different) width is irrelevant here.
+    this.dimensions = primary.dimensions;
     this.space = primary.space;
-    this.breaker = breaker ?? new CircuitBreaker({ onTransition: onStateChange });
+    this.breaker =
+      breaker ?? new CircuitBreaker(onStateChange ? { onTransition: onStateChange } : {});
+    if (breaker && onStateChange) this.breaker.addObserver(onStateChange);
   }
 
   /** Space the primary would serve in (used to backfill legacy rows). */
@@ -285,13 +332,13 @@ export class ResilientEmbeddingProvider implements EmbeddingGateway {
   }
 
   async embedTagged(text: string): Promise<TaggedEmbedding> {
-    if (this.breaker.canAttempt()) {
+    if (this.breaker.beginAttempt()) {
       try {
         const vector = await this.primary.embed(text);
-        this.breaker.recordSuccess();
+        this.breaker.settleAttempt(true);
         return { vector, space: this.primary.space };
       } catch {
-        this.breaker.recordFailure();
+        this.breaker.settleAttempt(false);
       }
     }
     return this.fallback.embedTagged(text);
@@ -300,26 +347,26 @@ export class ResilientEmbeddingProvider implements EmbeddingGateway {
   async embedIn(space: string, text: string): Promise<Float32Array | null> {
     if (space === this.fallback.space) return this.fallback.embed(text);
     if (space !== this.primary.space) return null; // unknown/retired space
-    if (!this.breaker.canAttempt()) return null;
+    if (!this.breaker.beginAttempt()) return null;
     try {
       const vector = await this.primary.embed(text);
-      this.breaker.recordSuccess();
+      this.breaker.settleAttempt(true);
       return vector;
     } catch {
-      this.breaker.recordFailure();
+      this.breaker.settleAttempt(false);
       return null;
     }
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
-    if (this.breaker.canAttempt()) {
+    if (this.breaker.beginAttempt()) {
       try {
         const out = await this.primary.embedBatch(texts);
-        this.breaker.recordSuccess();
+        this.breaker.settleAttempt(true);
         return out;
       } catch {
-        this.breaker.recordFailure();
+        this.breaker.settleAttempt(false);
       }
     }
     return this.fallback.embedBatch(texts);
@@ -332,13 +379,13 @@ export class ResilientEmbeddingProvider implements EmbeddingGateway {
    */
   async embedBatchTagged(texts: string[]): Promise<TaggedEmbedding[]> {
     if (texts.length === 0) return [];
-    if (this.breaker.canAttempt()) {
+    if (this.breaker.beginAttempt()) {
       try {
         const out = await this.primary.embedBatchTagged(texts);
-        this.breaker.recordSuccess();
+        this.breaker.settleAttempt(true);
         return out;
       } catch {
-        this.breaker.recordFailure();
+        this.breaker.settleAttempt(false);
       }
     }
     return this.fallback.embedBatchTagged(texts);
@@ -347,10 +394,15 @@ export class ResilientEmbeddingProvider implements EmbeddingGateway {
 
 export function normalizeInPlace(v: Float32Array): void {
   let sum = 0;
-  for (let i = 0; i < v.length; i++) sum += v[i] * v[i];
+  // for-of iterates values directly, which noUncheckedIndexedAccess cannot
+  // pollute with undefined — index reads below the array bound are numbers.
+  for (const x of v) sum += x * x;
   if (sum === 0) return;
   const inv = 1 / Math.sqrt(sum);
-  for (let i = 0; i < v.length; i++) v[i] *= inv;
+  for (let i = 0; i < v.length; i++) {
+    const x = v[i];
+    if (x !== undefined) v[i] = x * inv;
+  }
 }
 
 export function cosine(a: Float32Array, b: Float32Array): number {
@@ -359,9 +411,12 @@ export function cosine(a: Float32Array, b: Float32Array): number {
   let na = 0;
   let nb = 0;
   for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
+    const x = a[i];
+    const y = b[i];
+    if (x === undefined || y === undefined) continue;
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
   }
   if (na === 0 || nb === 0) return 0;
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
@@ -389,7 +444,8 @@ export function createEmbeddingProvider(cfg: {
       new DeepSeekEmbeddingProvider({
         apiKey: cfg.apiKey,
         model: cfg.model,
-        baseUrl: cfg.baseUrl,
+        // exactOptionalPropertyTypes: only carry baseUrl when actually set.
+        ...(cfg.baseUrl !== undefined ? { baseUrl: cfg.baseUrl } : {}),
       }),
       new OfflineBM25EmbeddingProvider(cfg.dimensions),
     );

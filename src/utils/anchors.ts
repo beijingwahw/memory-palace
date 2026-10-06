@@ -18,6 +18,15 @@ import { hash32 } from './embedding.js';
 /** Number of anchor directions. 4 planes → 16 buckets, Hamming-1 fanout 5. */
 export const ANCHOR_COUNT = 4;
 
+/**
+ * Memoized planes per dimension count, bounded to 16 keys. Real
+ * embedding widths form a small closed set (128/256/512/1024/…), but
+ * anchorKey()/anchorPlanes() accept ANY vector length, so an unbounded
+ * map could grow without limit on varied or adversarial input. Past the
+ * cap the planes are simply recomputed on every call — memoization is a
+ * pure accelerator, never a correctness dependency.
+ */
+const PLANE_CACHE_MAX_KEYS = 16;
 const planeCache = new Map<number, Float32Array[]>();
 
 /** Memoized anchor planes for a dimension count (weights depend only on (j, i)). */
@@ -32,7 +41,7 @@ export function anchorPlanes(dims: number): Float32Array[] {
     }
     planes.push(w);
   }
-  planeCache.set(dims, planes);
+  if (planeCache.size < PLANE_CACHE_MAX_KEYS) planeCache.set(dims, planes);
   return planes;
 }
 
@@ -42,7 +51,13 @@ export function anchorKey(v: Float32Array): string {
   let key = '';
   for (const plane of planes) {
     let proj = 0;
-    for (let i = 0; i < v.length; i++) proj += v[i] * plane[i];
+    // Same-length plane (anchorPlanes(v.length)) and vector; reads below the
+    // bounds are numbers, so the undefined branch is unreachable.
+    for (let i = 0; i < v.length; i++) {
+      const x = v[i];
+      const w = plane[i];
+      if (x !== undefined && w !== undefined) proj += x * w;
+    }
     key += proj >= 0 ? '+' : '-';
   }
   return key;

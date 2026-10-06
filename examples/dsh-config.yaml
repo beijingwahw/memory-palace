@@ -34,6 +34,29 @@ memoryPalace:
       depth: 3          # top hits forming the centroid
     entityHop: true     # recall items linked to top-hit entities
     queryCache: true    # near-duplicate queries skip the pipeline
+    ivf:                # deterministic IVF bucket index — pure accelerator:
+      enabled: true     # probe radius escalates until the candidate pool is
+      radius: 1         # satisfied, ending in all-keys = the exact scan, so
+      minItems: 2000    # recall never depends on the index. Engages only
+                        # above this many items per space (below it the
+                        # exact scan is already fast).
+    quantization: int8  # vector storage precision: int8 = 4× denser with
+                        # bounded (measured) cosine error; float32 = exact
+    fusionLearning:     # online fusion learning: engagement feedback moves
+      enabled: true     # the vector/keyword blend (and PRF/graph weights)
+      lr: 0.02          # inside fixed ±20% safety rails; audit via
+                        # memory_bandit; reflection stays the offline bound
+    # Write-time intelligence (memory_remember) similarity thresholds —
+    # defaults shown, commented; unset values are byte-identical:
+    #   writeDedupeThreshold: 0.92   # near-duplicate merge line — sparse
+    #                              # (offline-bm25) embeddings over-score
+    #                              # templated numeric content; lower it for
+    #                              # such corpora (the response's writeOutcome
+    #                              #   + advisory makes every merge visible)
+    #   conflictScanThreshold: 0.75  # conflict-scan floor — high similarity
+    #                              # + contradiction routes the write to the
+    #                              # supersede/conflict path, never a silent
+    #                              # merge (pinned as invariant I-RC-14)
 
   compression:
     enabled: true
@@ -74,3 +97,30 @@ memoryPalace:
   #   workspace → this workspace, widening to own + global when thin
   #   session   → this session, widening to workspace, then own + global
   scope: user
+  #
+  # anonymousPolicy — treatment of writes from callers carrying NO identity
+  # at all (no user / workspace / session id). Unset = "global". Three states:
+  #   global      anonymous writes land the shared global tier — the
+  #               zero-config default, byte-identical to previous behavior
+  #   quarantine  anonymous writes land the "__anonymous__" session bucket,
+  #               invisible to identified users — recommended default for
+  #               multi-tenant hosts
+  #   reject      anonymous writes are refused outright (fail-closed; for
+  #               hosts that guarantee identity at their own boundary)
+  #
+  # adminUserIds — admin allowlist for GLOBAL SIDE EFFECTS (today: live
+  # memory_migrate runs). Unset = single-user trust model (confirm-only,
+  # zero-config compatible). Once set, a live run requires BOTH the
+  # caller's userId being on the list AND confirm:true (double gate);
+  # anonymous callers and non-members are refused fail-closed.
+  # Recommended for multi-tenant hosts (pair it with anonymousPolicy
+  # above). The MCP server reads the same list from the
+  # MEMORY_PALACE_ADMIN_IDS environment variable (empty arrays and
+  # empty-string entries fail loud).
+  # Fully-expanded form (defaults commented out):
+  # scope:
+  #   kind: user
+  #   anonymousPolicy: quarantine
+  #   adminUserIds:
+  #     - "user-alice"       # members may run live migrations (with
+  #     - "ops-bot-01"       # confirm:true); everyone else is refused

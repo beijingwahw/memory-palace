@@ -27,6 +27,7 @@
  * descending then pattern name ascending. Output is capped at 50 patterns.
  */
 
+import { invariant } from './invariants.js';
 import { tokenize } from './tokenizer.js';
 import { clamp01 } from './math.js';
 
@@ -169,8 +170,7 @@ export function minePatterns(items: MinerItem[], opts: MineOptions = {}): MinedP
   // Mining only ever sees what the user actually said; keep original
   // indexes so evidence can fall back to index-as-string.
   const userItems: Array<{ item: MinerItem; index: number }> = [];
-  for (let index = 0; index < items.length; index++) {
-    const item = items[index];
+  for (const [index, item] of items.entries()) {
     if (item.role === undefined || item.role === 'user') {
       userItems.push({ item, index });
     }
@@ -261,10 +261,14 @@ export function minePatterns(items: MinerItem[], opts: MineOptions = {}): MinedP
       .sort();
     for (let i = 0; i < present.length; i++) {
       for (let j = i + 1; j < present.length; j++) {
-        const key = `${present[i]}+${present[j]}`;
+        const a = present[i];
+        const b = present[j];
+        // Both indices are bounded by present.length (loop guards).
+        invariant(a !== undefined && b !== undefined, 'pair indices bounded by present.length');
+        const key = `${a}+${b}`;
         let pair = pairs.get(key);
         if (!pair) {
-          pair = { a: present[i], b: present[j], count: 0, days: new Set<number>(), items: [] };
+          pair = { a, b, count: 0, days: new Set<number>(), items: [] };
           pairs.set(key, pair);
         }
         pair.count += 1;

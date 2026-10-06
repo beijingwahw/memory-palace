@@ -1,7 +1,7 @@
 {
   "name": "@dsh-plugins/memory-palace",
-  "version": "0.7.1",
-  "description": "DSH Memory Palace - Layered long-term memory plugin for DeepSeek Harness. Episodic/semantic/procedural memory behind a four-tier visibility ACL; explainable SQL-pushdown cosine retrieval; time-decayed personalized PageRank; consensus synthesis; tombstoned right-to-be-forgotten; health observability; embedding failover; transactional two-phase ingest; TTL + retention lifecycle; access-refreshed decay; visibility-checked tools; SWR rank caches, Memory Capsules (inter-agent transport), reflection-based self-tuning, and an MCP stdio server; pseudo-relevance feedback, entity-hop recall expansion, as-of flashback queries, and a semantic query cache.",
+  "version": "0.24.0",
+  "description": "DSH Memory Palace — Living Core + sleep-cycle consolidation + transitive inference (typed relations, derived facts, provenance traces), type-checked (ESLint + noUncheckedIndexedAccess), Layered long-term memory plugin for DeepSeek Harness. Episodic/semantic/procedural memory behind a four-tier visibility ACL; explainable SQL-pushdown cosine retrieval; time-decayed personalized PageRank; consensus synthesis; tombstoned right-to-be-forgotten; health observability; embedding failover; transactional two-phase ingest; TTL + retention lifecycle; access-refreshed decay; visibility-checked tools; SWR rank caches, Memory Capsules (inter-agent transport), reflection-based self-tuning, and an MCP stdio server; pseudo-relevance feedback, entity-hop recall expansion, as-of flashback queries, and a semantic query cache.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -43,9 +43,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test --import tsx test/*.test.ts",
-    "lint": "tsc --noEmit",
+    "fuzz": "node --import tsx --test test/chaos.test.ts",
+    "audit": "node scripts/audit.mjs",
+    "lint": "eslint . && tsc --noEmit -p tsconfig.json",
+    "bench": "node scripts/bench.mjs",
+    "bench:update": "node scripts/bench.mjs --update",
     "prepublishOnly": "npm run verify",
-    "verify": "npm run lint && npm run build && npm test"
+    "verify": "npm run lint && npm run build && npm test && npm run audit"
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
@@ -54,7 +58,10 @@
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.7.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "eslint": "^9.36.0",
+    "typescript-eslint": "^8.44.0",
+    "@eslint/js": "^9.36.0"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-protocol": "^0.1.0",

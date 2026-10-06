@@ -51,6 +51,27 @@ test('plural "last weeks" is also blocked by the lookahead guard', () => {
   assert.equal(h.untilMs, undefined, 'untilMs must be unset');
 });
 
+test('"last weekend" imposes no window (end lookahead)', () => {
+  // The [-14d,-7d] week window would EXCLUDE the actual previous weekend
+  // days it is asked about, so the idiom rule must not fire at all.
+  const h = parse('what did I do last weekend');
+  assert.equal(h.sinceMs, undefined, 'sinceMs must be unset');
+  assert.equal(h.untilMs, undefined, 'untilMs must be unset');
+  assert.equal(h.wantsRecent, false, 'no rule may fire at all');
+});
+
+test('"the last years" imposes no window (plural blocked)', () => {
+  const h = parse('the last years of the project');
+  assert.equal(h.sinceMs, undefined, 'sinceMs must be unset');
+  assert.equal(h.untilMs, undefined, 'untilMs must be unset');
+});
+
+test('"laptop 3 days ago" does not parse a topK', () => {
+  // \b guard: the "top" inside "laptop" is not a result-size request.
+  const h = parse('issues with my laptop 3 days ago');
+  assert.equal(h.topK, undefined, 'topK must be unset');
+});
+
 // ---------------------------------------------------------------------------
 // MUST open a window (true idioms survive the guards)
 // ---------------------------------------------------------------------------

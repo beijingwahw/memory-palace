@@ -7,15 +7,71 @@
  *  - procedural: user preferences and behavioral patterns (how the user works)
  */
 
-import type { VisibilityTier } from '../utils/scope.js';
+/** Visibility tier for memory rows — the ACL's atomic unit (see utils/scope.ts). */
+export type VisibilityTier = 'global' | 'user' | 'workspace' | 'session';
 
 /** Single source of truth for the package version (keep in sync with package.json). */
-export const VERSION = '0.7.1';
+export const VERSION = '0.24.0';
 
 export type MemoryLayer = 'episodic' | 'semantic' | 'procedural';
 
 /** Memory visibility scope. See `utils/scope.ts` for the tier ACL. */
 export type MemoryScopeKind = 'user' | 'workspace' | 'session';
+
+/**
+ * Tri-state policy for writes that carry NO owner id at all (anonymous
+ * callers — no userId, no workspaceId, not even a sessionId). Declared
+ * LOCALLY: types/index.ts never imports from utils (dependency direction
+ * is utils → types); the semantics and enforcement live in
+ * applyAnonymousWritePolicy() in utils/scope.ts.
+ *
+ *   'global'     — legacy default: the write lands in the global shared
+ *                  bucket exactly as it always did (fail-open, kept for
+ *                  zero-migration back-compat).
+ *   'quarantine' — the write is isolated into the synthetic
+ *                  '__anonymous__' session bucket (visibility 'session');
+ *                  invisible to every identified user's read cascade.
+ *   'reject'     — fail-closed: the ingest throws before any store write
+ *                  (for hosts carrying an identity guarantee).
+ */
+export type AnonymousWritePolicy = 'global' | 'quarantine' | 'reject';
+
+/**
+ * The scope config section: the home visibility tier KIND plus the
+ * anonymous-write policy. At install time (index.ts MemoryPalaceOptions)
+ * the LEGACY scalar form — `scope: 'user'` — is still accepted and
+ * normalized into this shape (`{ kind: 'user', anonymousPolicy: 'global' }`),
+ * so existing host configs and programmatic callers keep working
+ * byte-identically.
+ */
+export interface ScopeSettings {
+  /** Home visibility tier for new memories (see utils/scope.ts). */
+  kind: MemoryScopeKind;
+  /**
+   * Policy for writes carrying no owner id at all — see
+   * AnonymousWritePolicy above. Defaults to 'global'.
+   */
+  anonymousPolicy?: AnonymousWritePolicy;
+  /**
+   * Admin whitelist for GLOBAL-side-effect tools (memory_migrate's live
+   * re-embed). TRI-STATE, keyed on PRESENCE, not value:
+   *
+   *   key ABSENT   — unconfigured: the single-user trust model. Every
+   *                  historical install: any caller may run a live
+   *                  migration with confirm:true. DEFAULT_CONFIG
+   *                  deliberately omits the key so this is the default.
+   *   key PRESENT  — configured: a live call additionally requires the
+   *                  caller's tctx.userId to be listed. An undefined
+   *                  userId is REJECTED (fail-closed) — an anonymous
+   *                  caller can never satisfy a membership check.
+   *
+   * Present-but-empty ([] or ['']) is a CONFIG ERROR, rejected loudly at
+   * install time (index.ts): "configured but nobody allowed" is almost
+   * always a typo, and silently accepting it would brick the tool while
+   * LOOKING locked down. Elements must be non-empty strings.
+   */
+  adminUserIds?: string[];
+}
 
 /** Caller identity used to scope ingestion and retrieval. */
 export interface MemoryScope {
@@ -49,6 +105,16 @@ export interface MemoryItem {
   entityId?: string;
   /** Visibility tier backing this row (ACL; see utils/scope.ts). */
   visibility?: VisibilityTier;
+  /**
+   * Owner backfill (populated by MemoryStore.rowToItem from the DB row's
+   * owner columns) so JS-side callers can re-check the tier ACL without a
+   * second query — see visibleAtLevel() in utils/scope.ts. These mirror
+   * the persisted owner columns and are NOT part of the capsule
+   * projection (capsules serialize metadata only).
+   */
+  userId?: string;
+  workspaceId?: string;
+  sessionId?: string;
 }
 
 export interface MemoryMetadata {
@@ -64,7 +130,12 @@ export interface MemoryMetadata {
   expiresAt?: number;
   /** Which embedding space produced `embedding` (e.g. "deepseek:deepseek-embed"). */
   embeddingSpace?: string;
-  /** Visibility tier for this item (ACL; defaults from the configured scope). */
+  /**
+   * @deprecated Legacy input alias — the `visibility` column / the
+   * item-level `MemoryItem.visibility` field is the single source of
+   * truth; this metadata copy is not persisted since 0.20.0 (still read
+   * at insert time to derive the tier).
+   */
   visibility?: VisibilityTier;
   [extra: string]: unknown;
 }
@@ -143,6 +214,12 @@ export interface RetrievalQuery {
   /** FLASHBACK: retrieve memories as they existed at this unix-ms time
    *  (respects tombstone/supersession timestamps, not just creation). */
   asOfMs?: number;
+  /** Learned fusion weights (feedback bandit) overriding config rails. */
+  fusionOverrides?: Partial<Record<string, number>>;
+  /** INTERNAL — speculative warmth mode: full pipeline, ZERO side effects
+   *  (no events, no reinforcement, no trajectory logging). Used by
+   *  retriever.prefetch() and the reflector's benchmark probes. */
+  speculative?: boolean;
 }
 
 /** Per-hit score decomposition — every factor that produced finalScore. */
@@ -180,6 +257,11 @@ export interface RetrievalHit {
   mmrRank: number;
   /** Final fused score after graph prior, decay and optional keyword rerank */
   finalScore: number;
+  /**
+   * Final rank AFTER fusion/rerank (1 = best). mmrRank above keeps its
+   * MMR-stage meaning and is not recomputed once fusion reorders the pool.
+   */
+  finalRank?: number;
   /** Cascade level this hit entered the pool at (0 = narrowest tier). */
   scopeLevel?: number;
   /** How this hit was recalled: vector scan or entity-anchor hop. */
@@ -217,6 +299,12 @@ export interface CompressionReport {
   savedTokens: number;
   newSemanticItems: number;
   evictedItems: number;
+  /** Maintainer housekeeping counters (optional — older callers never
+   *  produced them; surfaced when the corresponding stage actually ran). */
+  expiredSwept?: number;
+  eventsPruned?: number;
+  tombstonesPurged?: number;
+  patternsMined?: number;
 }
 
 export interface PluginConfig {
@@ -251,6 +339,44 @@ export interface PluginConfig {
     entityHop: boolean;
     /** Deterministic semantic cache for near-duplicate queries. */
     queryCache: boolean;
+    /** Vector storage precision: 'int8' (4× denser, bounded error < 0.002) or 'float32' (exact). */
+    quantization: 'int8' | 'float32';
+    /** Online fusion learning from engagement feedback (bounded rails). */
+    fusionLearning: {
+      enabled: boolean;
+      /** Learning rate per feedback event (0.01–0.05 sane). */
+      lr: number;
+    };
+    /** Deterministic IVF bucket index (pure accelerator; escalation ends
+     * in all-keys = the exact scan — recall never depends on it). */
+    ivf: {
+      enabled: boolean;
+      /** Starting Hamming probe radius (1 = 5/16 buckets). */
+      radius: number;
+      /** Only engage IVF above this many space items — below it the exact
+       * scan is already fast and the join overhead is pure loss. */
+      minItems: number;
+    };
+    /**
+     * Raw-cosine floor for memory_remember's write-time NEAR-DUPLICATE
+     * scan. An existing hit at/above it that is NOT contradictory returns
+     * the existing id (deduplicated) instead of storing a clone; a
+     * contradictory one falls through to the conflict/update path — high
+     * similarity alone never merges "v16" into "v17". Domain [0.5, 1]:
+     * values outside are clamped at use time and NaN/±Infinity fall back
+     * to this default (see finiteOr/clampThreshold in index.ts). Default
+     * 0.92: only true paraphrases merge.
+     */
+    writeDedupeThreshold?: number;
+    /**
+     * Raw-cosine floor for memory_remember's CONFLICT scan: existing
+     * memories at/above it are checked for contradictions (differing
+     * numeric signatures, affirmative vs negated wording). Deliberately
+     * WIDER than writeDedupeThreshold so an update that rewords heavily
+     * still gets flagged. Domain [0, 1] — clamped at use time, NaN falls
+     * back to this default. Default 0.75.
+     */
+    conflictScanThreshold?: number;
   };
   compression: {
     enabled: boolean;
@@ -277,8 +403,10 @@ export interface PluginConfig {
     /** Pre-warm personalized PageRank for the opening intent's entities at
      *  session start (pure local compute, zero API cost). Default true. */
     warmRanks: boolean;
+    /** Fraction of the injection budget reserved for core SELF blocks (0 disables). */
+    coreBudgetFraction: number;
   };
-  scope: MemoryScopeKind;
+  scope: ScopeSettings;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -300,6 +428,13 @@ export const DEFAULT_CONFIG: PluginConfig = {
     prf: { enabled: true, alpha: 0.7, beta: 0.3, depth: 3 },
     entityHop: true,
     queryCache: true,
+    ivf: { enabled: true, radius: 1, minItems: 2000 },
+    quantization: 'int8',
+    fusionLearning: { enabled: true, lr: 0.02 },
+    // Write-time scan floors for memory_remember (explicit so the defaults
+    // are discoverable here rather than buried in index.ts literals).
+    writeDedupeThreshold: 0.92,
+    conflictScanThreshold: 0.75,
   },
   compression: {
     enabled: true,
@@ -321,6 +456,14 @@ export const DEFAULT_CONFIG: PluginConfig = {
     systemPromptPrefix:
       'You have access to a long-term memory palace. When the user references past context, consult it via the memory_retrieve tool before answering.',
     warmRanks: true,
+    coreBudgetFraction: 1 / 3,
   },
-  scope: 'user',
+  // Anonymous-write policy default. 'global' is the SECURITY-COMPATIBLE
+  // choice, not the safest one: it reproduces the historical behavior
+  // byte-for-byte (anonymous writes degrade to the global shared bucket),
+  // so existing installs keep their exact data shape on upgrade. Hosts
+  // that want isolation can set 'quarantine' (anonymous writes go to the
+  // '__anonymous__' session bucket, invisible to identified users) or
+  // 'reject' (fail-closed throw, for identity-guarantee hosts).
+  scope: { kind: 'user', anonymousPolicy: 'global' },
 };

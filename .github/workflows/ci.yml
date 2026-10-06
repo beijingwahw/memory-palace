@@ -7,13 +7,32 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      # Report failures from EVERY matrix leg — one flaky leg must
+      # not cancel the still-informative runs.
+      fail-fast: false
+      matrix:
+        # 2 OS × 2 Node = 4 legs; everything except the (gated) MCP
+        # smoke below runs on all four. Windows is a first-class host
+        # for MCP stdio mounts (Claude Desktop), so it earns a leg.
+        os: [ubuntu-latest, windows-latest]
+        node-version: [22, 24]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
+      # better-sqlite3 on windows-latest: v12 ships prebuilt win32-x64
+      # binaries for the Node ABIs we test (22/24), so `npm ci` normally
+      # downloads a prebuild and never compiles. Risk: if a prebuild is
+      # ever missing (fresh ABI before upstream catches up, prebuild CDN
+      # outage), prebuild-install falls back to node-gyp source build —
+      # and GitHub's windows-latest image ships VS Build Tools / MSVC
+      # out of the box, so that fallback also succeeds, just slower.
+      # No extra setup is required either way; a leg only fails if BOTH
+      # the prebuild is missing AND MSVC were absent (it is not).
       - run: npm ci
       - name: Typecheck (lint)
         run: npm run lint
@@ -21,7 +40,23 @@ jobs:
         run: npm run build
       - name: Tests
         run: npm test
+      # Deep chaos-fuzz gate: re-runs the chaos suite standalone with an
+      # extended 8-seed rotation (plain `npm test` runs the suite's 4-seed
+      # default; CHAOS_SEEDS widens the trajectory search space here).
+      - name: Chaos fuzz (extended seeds)
+        run: npm run fuzz
+        env:
+          CHAOS_SEEDS: '31337,1,7,42,9999,20261005,777,31415'
+      - name: Self-audit gate
+        run: npm run audit
+      # Smoke the MCP server binary ONCE, on the ubuntu + node 22 leg
+      # only: the smoke exercises the built binary's JSON-RPC protocol,
+      # which is Node-version AND platform independent (the in-process
+      # protocol suite genesis-entries.test.ts already runs on every
+      # leg) — re-running the binary smoke per matrix leg adds CI
+      # minutes without new signal.
       - name: Smoke the MCP server binary
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 22
         run: |
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

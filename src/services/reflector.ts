@@ -26,12 +26,14 @@ import type { MemoryEventBus, MemoryItem, MemoryScope } from '../types/index.js'
 import { NOOP_BUS } from '../types/index.js';
 import type { MemoryStore } from './memory-store.js';
 import type { MemoryGraph } from './memory-graph.js';
+import { invariant } from '../utils/invariants.js';
 import { MemoryRetriever, type RetrieverConfig } from './memory-retriever.js';
 
 export interface ReflectionSweep {
   params: ReflectionParams;
   mrr: number;
-  recallAt5: number;
+  /** Recall at the sweep's K (opts.topK, default 5) — name matches the knob. */
+  recallAtK: number;
   objective: number;
 }
 
@@ -82,6 +84,7 @@ export class MemoryReflector {
           // Caches would leak across sweeps AND get invalidated by
           // touchAccess writes; disable both for clean measurement.
           queryCache: false,
+          ivf: this.baseCfg.ivf,
           entityHop: this.baseCfg.entityHop,
         },
         this.graph,
@@ -90,7 +93,7 @@ export class MemoryReflector {
       const positions = await this.probe(retriever, bench, scope, topK);
       const m = mrr(positions);
       const r = recallAtK(positions, topK);
-      sweeps.push({ params, mrr: m, recallAt5: r, objective: objective(m, r) });
+      sweeps.push({ params, mrr: m, recallAtK: r, objective: objective(m, r) });
     }
 
     const currentKey = keyOf({
@@ -98,17 +101,22 @@ export class MemoryReflector {
       prfAlpha: this.baseCfg.prf.alpha,
       prfBeta: this.baseCfg.prf.beta,
     });
-    const current =
-      sweeps.find((s) => keyOf(s.params) === currentKey) ?? sweeps[sweeps.length - 1];
+    const matched = sweeps.find((s) => keyOf(s.params) === currentKey);
+    const lastSweep = sweeps[sweeps.length - 1];
+    const current = matched ?? lastSweep;
+    // reflectionGrid builds its axes from non-empty arrays, so the sweep
+    // list always has entries and the last-slot fallback always exists.
+    invariant(current !== undefined, 'reflectionGrid always yields at least one sweep');
     const best = sweeps.reduce((a, b) => (b.objective > a.objective ? b : a));
     const report: ReflectionReport = {
       entries: bench.length,
       current,
       best,
       improved: best.objective > current.objective + 1e-6,
-      recommendation: best
-        ? `retrieval.graphBoost=${best.params.graphBoost}, retrieval.prf.alpha=${best.params.prfAlpha}, retrieval.prf.beta=${best.params.prfBeta} (objective ${(best.objective ?? 0).toFixed(3)} vs current ${(current.objective ?? 0).toFixed(3)})`
-        : 'insufficient data',
+      recommendation:
+        `retrieval.graphBoost=${best.params.graphBoost}, retrieval.prf.alpha=${best.params.prfAlpha}, ` +
+        `retrieval.prf.beta=${best.params.prfBeta} ` +
+        `(objective ${best.objective.toFixed(3)} vs current ${current.objective.toFixed(3)})`,
     };
     this.bus.emit('memory.reflected', {
       entries: bench.length,
@@ -126,7 +134,14 @@ export class MemoryReflector {
   ): Promise<Array<number | null>> {
     const positions: Array<number | null> = [];
     for (const entry of bench) {
-      const res = await retriever.retrieve({ query: entry.query, topK, scope });
+      // Speculative: benchmark probes must not reinforce items nor
+      // pollute the trajectory log — measurement integrity.
+      const res = await retriever.retrieve({
+        query: entry.query,
+        topK,
+        scope,
+        speculative: true,
+      });
       positions.push(rankOf(res.hits.map((h) => h.item.id), entry.labelItemId));
     }
     return positions;
@@ -134,5 +149,10 @@ export class MemoryReflector {
 }
 
 function keyOf(p: ReflectionParams): string {
-  return `${p.graphBoost}|${p.prfAlpha}|${p.prfBeta}`;
+  // unique() (utils/reflection.ts) normalizes grid axes via
+  // Number(v.toFixed(3)), so the lookup key must round the same way —
+  // a baseCfg carrying >3 decimals (graphBoost 0.1234) would otherwise
+  // miss its normalized grid point (0.123) and fall back to the LAST
+  // (most aggressive) sweep as "current".
+  return `${p.graphBoost.toFixed(3)}|${p.prfAlpha.toFixed(3)}|${p.prfBeta.toFixed(3)}`;
 }

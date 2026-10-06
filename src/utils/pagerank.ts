@@ -20,6 +20,13 @@
  *
  * Dangling-mass redistribution also follows the teleport vector, which
  * keeps total rank mass at exactly 1 for every configuration.
+ *
+ * Kernel-side edge sanitation: edges with non-finite weight (NaN passes
+ * straight through `Math.max(0, NaN)` and would poison every rank it
+ * touches) and edges whose endpoints are not in `nodes` are DROPPED in
+ * the kernel. Callers no longer need to pre-filter edge sets against the
+ * node list — historically a foreign endpoint lazily became a
+ * zero-contribution edge only if the caller had passed consistent sets.
  */
 
 import { clampNum } from './math.js';
@@ -61,11 +68,21 @@ export function pageRank(
   const decayDays = opts.edgeDecayDays ?? 0;
   const now = opts.now ?? Date.now();
 
-  // Effective (decayed) weights and out-weight sums.
+  // Effective (decayed) weights and out-weight sums. The kernel defends
+  // itself here instead of trusting the caller to pre-filter:
+  //   - non-finite weights are dropped (NaN survives Math.max(0, NaN) and
+  //     would propagate NaN into every downstream rank; Infinity would
+  //     dwarf all other mass);
+  //   - edges whose endpoints are outside `nodes` are dropped (they used
+  //     to lazily degenerate into zero-contribution rows that still
+  //     demanded a consistent node set from the caller).
+  const nodeSet = new Set(nodes);
   const outW = new Map<string, number>();
   const inEdges = new Map<string, Array<{ from: string; w: number }>>();
   for (const e of edges) {
     if (e.from === e.to) continue;
+    if (!Number.isFinite(e.weight)) continue;
+    if (!nodeSet.has(e.from) || !nodeSet.has(e.to)) continue;
     let w = Math.max(0, e.weight);
     if (decayDays > 0 && e.lastSeenAt !== undefined) {
       const ageDays = Math.max(0, (now - e.lastSeenAt) / DAY_MS);
@@ -79,12 +96,11 @@ export function pageRank(
   }
 
   // Teleport vector: uniform over seeds ∩ nodes, else uniform over all.
-  const nodeSet = new Set(nodes);
   const seedSet = new Set((opts.seeds ?? []).filter((s) => nodeSet.has(s)));
   const teleport = new Map<string, number>();
   const basis = seedSet.size > 0 ? [...seedSet] : nodes;
   for (const v of nodes) teleport.set(v, 0);
-  for (const v of basis) teleport.set(v!, 1 / basis.length);
+  for (const v of basis) teleport.set(v, 1 / basis.length);
 
   let rank = new Map<string, number>();
   for (const v of nodes) rank.set(v, 1 / n);

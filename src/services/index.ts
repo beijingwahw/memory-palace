@@ -133,6 +133,63 @@ export {
   type ImportReport,
 } from './memory-federation.js';
 
+// ----- Service classes (extension authors) ---------------------------------
+// Previously only the "core five" services were re-exported; the nine
+// below were reachable only via deep imports that the package exports
+// field blocks. Re-exported here so external extensions can type and
+// construct them from the barrel like everything else.
+
+export {
+  CoreMemoryService,
+  CORE_BLOCK_NAMES,
+  DEFAULT_BLOCK_CAP,
+  type CoreBlock,
+  type CoreBlockName,
+  type CoreHistoryEntry,
+  type CoreWriteResult,
+} from './core-memory.js';
+
+export { SleepCycle, type DreamReport } from './sleep.js';
+
+export {
+  Inferencer,
+  type InferenceReport,
+} from './inferencer.js';
+
+export {
+  SpaceMigrator,
+  type MigrationTickResult,
+} from './space-migrator.js';
+
+export {
+  IntentPredictor,
+  type PrefetchReport,
+} from './intent-predictor.js';
+
+export {
+  FeedbackLearner,
+  type LearnReport,
+} from './feedback-learner.js';
+
+export {
+  Stratifier,
+  type StratifyReport,
+} from './stratifier.js';
+
+export {
+  FederatedRetriever,
+  type PalaceMember,
+} from './federated-retriever.js';
+
+export {
+  CrdtFederation,
+  type SyncReport,
+} from './crdt-federation.js';
+
+// ----- Genesis invariant layer ----------------------------------------------
+
+export { invariant, assertNamedParamParity } from '../utils/invariants.js';
+
 export {
   MemoryReflector,
   type ReflectionReport,
@@ -169,3 +226,7 @@ export {
 export { clamp01, clampNum } from '../utils/math.js';
 export { McpPalaceServer, MCP_PROTOCOL_VERSION } from '../mcp-server.js';
 export { VERSION } from '../types/index.js';
+
+// HTTP federation transport (server + member client) — re-exported here
+// so extension authors reach it from the package barrel.
+export * from '../transport/index.js';

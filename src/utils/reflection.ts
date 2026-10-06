@@ -18,6 +18,8 @@
 
 import type { MemoryItem } from '../types/index.js';
 
+import { tokenize } from './tokenizer.js';
+
 export interface BenchEntry {
   /** Pseudo-query derived from the item itself. */
   query: string;
@@ -34,10 +36,10 @@ export interface BenchmarkOptions {
 
 /**
  * Build the self-consistency benchmark: for each suitable item, the
- * pseudo-query is its FIRST sentence, trimmed to 180 chars — the sentence
- * seeds the item's own embedding neighborhood. Items whose first sentence
- * is too short fall back to the whole content trimmed. Deterministic
- * order (input order), capped.
+ * pseudo-query is its FIRST sentence, trimmed to 180 CODE POINTS — the
+ * sentence seeds the item's own embedding neighborhood. Items whose first
+ * sentence is too short fall back to the whole content trimmed.
+ * Deterministic order (input order), capped.
  */
 export function buildBenchmark(
   items: MemoryItem[],
@@ -49,7 +51,8 @@ export function buildBenchmark(
   for (const item of items) {
     if (out.length >= maxEntries) break;
     const first = firstSentence(item.content);
-    const query = first.length >= 24 ? first.slice(0, 180) : item.content.slice(0, 180);
+    const query =
+      first.length >= 24 ? cpTruncate(first, 180) : cpTruncate(item.content, 180);
     if (countWords(query) < minTokens) continue;
     out.push({ query, labelItemId: item.id });
   }
@@ -116,11 +119,24 @@ function unique(values: number[]): number[] {
 }
 
 function firstSentence(text: string): string {
-  const m = text.match(/^[^.!?。！？]*[.!?。！？]/);
+  // The sentence-end punctuation must be followed by whitespace or the
+  // end of text — a '.' glued to a digit ("版本 3.14") is a decimal
+  // point, not a sentence boundary, and must not truncate here.
+  const m = text.match(/^[^.!?。！？]*[.!?。！？](?=\s|$)/);
   return m ? m[0] : text;
 }
 
+/**
+ * Word count via tokenize(): CJK runs count as their overlapping-bigram
+ * tokens, so a Chinese first sentence yields n-1 tokens for n characters
+ * instead of ONE giant script-run word — without this, every Chinese item
+ * failed the minTokens gate and the Chinese benchmark came out EMPTY.
+ */
 function countWords(s: string): number {
-  const m = s.match(/[\p{L}\p{N}_]+/gu);
-  return m ? m.length : 0;
+  return tokenize(s).length;
+}
+
+/** Truncate to at most `n` CODE POINTS (never splits a surrogate pair). */
+function cpTruncate(s: string, n: number): string {
+  return s.length <= n ? s : Array.from(s).slice(0, n).join('');
 }

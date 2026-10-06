@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "mode": "full",
+  "note": "Timed metrics gate at <=2x via `npm run bench`. Info metrics are recorded for context and never gate. Regenerate with `npm run bench:update` only after a deliberate, explained performance change.",
+  "generatedAt": "2026-10-05T15:02:52.718Z",
+  "node": "v24.19.0",
+  "scale": {
+    "scanItems": 5000,
+    "scanSamples": 10,
+    "scanWarmup": 3,
+    "quantCalls": 10000,
+    "quantDim": 1024,
+    "quantWarmup": 500,
+    "prNodes": 500,
+    "prEdges": 2000,
+    "prIters": 20,
+    "prSamples": 5,
+    "tokTargetKB": 100,
+    "tokSamples": 10
+  },
+  "metrics": {
+    "scan.exact.p50": 13.3811,
+    "scan.exact.p95": 17.217,
+    "scan.ivf.p50": 7.30685,
+    "scan.ivf.p95": 9.4188,
+    "quant.int8.p50": 1.4,
+    "quant.float.p50": 4.8,
+    "pagerank.total.p50": 4.3881,
+    "tokenizer.tokenize.perKB": 28.69487877457437,
+    "tokenizer.approx.perKB": 40.43149031660081
+  },
+  "info": {
+    "scan.ingestSecs": 0.6660428,
+    "scan.ivf.speedup": 1.8313089771926343,
+    "scan.exact.hits": 32,
+    "scan.ivf.hits": 32,
+    "quant.speedup": 3.428571428571429,
+    "quant.cosError": 2.2898349882893854e-16,
+    "pagerank.mass": 1,
+    "tokenizer.tokens": 23423
+  }
+}

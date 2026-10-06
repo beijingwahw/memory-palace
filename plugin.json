@@ -1,7 +1,7 @@
 {
   "name": "@dsh-plugins/memory-palace",
   "displayName": "Memory Palace",
-  "version": "0.7.1",
+  "version": "0.24.0",
   "description": "Layered long-term memory for DeepSeek Harness agents — and any MCP client. Memory Capsules for inter-agent knowledge transport, self-reflective retrieval tuning, four-tier visibility ACL, PRF + entity-hop recall, as-of flashback, personalized PageRank, tombstone right-to-be-forgotten.",
   "author": {
     "name": "DSH Community"
@@ -26,7 +26,16 @@
       "context-injector",
       "memory-palace",
       "memory-federation",
-      "memory-reflector"
+      "memory-reflector",
+      "memory-core",
+      "sleep-cycle",
+      "memory-inferencer",
+      "space-migrator",
+      "intent-predictor",
+      "feedback-learner",
+      "stratifier",
+      "crdt-federation",
+      "federated-retriever"
     ],
     "events": [
       "memory.before-retrieve",
@@ -40,7 +49,17 @@
       "memory.context-injected",
       "memory.capsule-exported",
       "memory.capsule-imported",
-      "memory.reflected"
+      "memory.reflected",
+      "memory.core-updated",
+      "memory.slept",
+      "memory.inferred",
+      "memory.space-migrated",
+      "memory.prefetched",
+      "memory.bandit-learned",
+      "memory.bandit-reset",
+      "memory.stratified",
+      "memory.crdt-synced",
+      "memory.federated-retrieved"
     ],
     "hooks": [
       "session.start",
@@ -59,7 +78,14 @@
     "memory_graph",
     "memory_capsule_export",
     "memory_capsule_import",
-    "memory_reflect"
+    "memory_reflect",
+    "memory_core",
+    "memory_sleep",
+    "memory_why",
+    "memory_migrate",
+    "memory_bandit",
+    "memory_era",
+    "memory_fed_search"
   ],
   "config": {
     "schema": {
@@ -158,6 +184,68 @@
               "type": "boolean",
               "default": true,
               "description": "Deterministic semantic cache for near-duplicate queries (anchor-bucketed, cosine-verified)"
+            },
+            "ivf": {
+              "type": "object",
+              "description": "Deterministic IVF bucket index — pure accelerator; probe radius escalates until the candidate pool is satisfied, and all-keys equals the exact scan (recall never depends on the index)",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "radius": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4,
+                  "default": 1,
+                  "description": "Starting Hamming probe radius (1 probes 5 of 16 buckets)"
+                },
+                "minItems": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 2000,
+                  "description": "Engage IVF only above this many items in the space — below it the exact scan is already fast"
+                }
+              }
+            },
+            "fusionLearning": {
+              "type": "object",
+              "description": "Online fusion learning: engagement feedback moves vector/keyword blend weights inside fixed safety rails (±20% of defaults), with decaying reward history and a full audit journal",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "lr": {
+                  "type": "number",
+                  "minimum": 0.001,
+                  "maximum": 0.05,
+                  "default": 0.02
+                }
+              }
+            },
+            "quantization": {
+              "type": "string",
+              "enum": [
+                "int8",
+                "float32"
+              ],
+              "default": "int8",
+              "description": "Vector storage precision: int8 = 4× denser with measured cosine error (<0.005 for d≤1024); float32 = exact"
+            },
+            "writeDedupeThreshold": {
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 1,
+              "default": 0.92,
+              "description": "Raw-cosine floor for memory_remember's near-duplicate scan: a NON-contradictory existing hit at/above it returns the existing id instead of storing a clone, while a contradictory one falls through to the conflict path. Clamped to [0.5, 1] at use time; NaN falls back to 0.92"
+            },
+            "conflictScanThreshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.75,
+              "description": "Raw-cosine floor for memory_remember's conflict scan — existing memories at/above it are checked for contradictions (differing values, affirmative vs negated). Clamped to [0, 1] at use time; NaN falls back to 0.75"
             }
           }
         },
@@ -242,18 +330,63 @@
               "type": "boolean",
               "default": true,
               "description": "Pre-warm personalized PageRank for the opening intent entities (local, free)"
+            },
+            "coreBudgetFraction": {
+              "type": "number",
+              "default": 0.333,
+              "description": "Fraction of the injection budget reserved for core SELF blocks (0 disables core injection)"
             }
           }
         },
         "scope": {
-          "type": "string",
-          "enum": [
-            "user",
-            "workspace",
-            "session"
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "user",
+                "workspace",
+                "session"
+              ],
+              "default": "user",
+              "description": "Legacy scalar form: home visibility tier for new memories."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "user",
+                    "workspace",
+                    "session"
+                  ],
+                  "default": "user",
+                  "description": "Home visibility tier for new memories; retrieval widens session→workspace→user→global and never crosses owner boundaries. memory_remember may override per item (visibility: global etc.)."
+                },
+                "anonymousPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "global",
+                    "quarantine",
+                    "reject"
+                  ],
+                  "default": "global",
+                  "description": "Policy for writes carrying no owner id at all: global = shared bucket (legacy default), quarantine = isolated __anonymous__ session bucket invisible to identified users, reject = fail-closed drop."
+                },
+                "adminUserIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "minItems": 1,
+                  "description": "When configured, live calls to global side-effect tools (memory_migrate's whole-store re-embed) require the caller's userId to be listed here; unconfigured = single-user trust model (any caller). Empty array or empty-string elements are rejected at install time."
+                }
+              }
+            }
           ],
           "default": "user",
-          "description": "Home visibility tier for new memories; retrieval widens session→workspace→user→global and never crosses owner boundaries. memory_remember may override per item (visibility: global etc.). Anonymous callers see the global tier only."
+          "description": "Home visibility tier for new memories; retrieval widens session→workspace→user→global and never crosses owner boundaries. memory_remember may override per item (visibility: global etc.). Anonymous callers see the global tier only; anonymous WRITES are governed by anonymousPolicy (object form)."
         }
       }
     }

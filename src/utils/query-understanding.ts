@@ -38,17 +38,36 @@ const RULES: Array<{
   {
     re: /(?:last|past)\s+(\d+)\s+(day|week|month)s?/i,
     window: (m) => {
-      const n = Math.min(365, Math.max(1, Number(m[1])));
-      const mult = m[2].toLowerCase() === 'day' ? 1 : m[2].toLowerCase() === 'week' ? 7 : 30;
-      return { sinceDays: -n * mult, markRecent: true };
+      const n = Math.max(1, Number(m[1]));
+      // Group 2 is mandatory in the pattern, so '' is unreachable — it
+      // only satisfies the indexer's `| undefined`.
+      const unit = (m[2] ?? '').toLowerCase();
+      const mult = unit === 'day' ? 1 : unit === 'week' ? 7 : 30;
+      // Clamp the PRODUCT (n × unit-in-days), not n alone: clamping n
+      // first let "last 365 months" slip through as a 30-year window.
+      const days = Math.min(730, Math.max(1, n * mult));
+      return { sinceDays: -days, markRecent: true };
     },
   },
   {
     re: /(?:最?近|过去)\s*(\d+)\s*(天|日|周|个?月)/,
     window: (m) => {
-      const n = Math.min(365, Math.max(1, Number(m[1])));
-      const mult = /天|日/.test(m[2]) ? 1 : /周/.test(m[2]) ? 7 : 30;
-      return { sinceDays: -n * mult, markRecent: true };
+      const n = Math.max(1, Number(m[1]));
+      // Group 2 is mandatory in the pattern; '' is unreachable.
+      const unitCn = m[2] ?? '';
+      const mult = /天|日/.test(unitCn) ? 1 : /周/.test(unitCn) ? 7 : 30;
+      // Same product clamp as the English rule above (1..730 days).
+      const days = Math.min(730, Math.max(1, n * mult));
+      return { sinceDays: -days, markRecent: true };
+    },
+  },
+  {
+    // "last 6 hours" / "最近 3 小时": sub-day windows, kept in days as
+    // fractions (sinceDays is multiplied by DAY downstream).
+    re: /(?:last|past)\s+(\d+)\s+hours?|(?:最?近|过去)\s*(\d+)\s*小时/i,
+    window: (m) => {
+      const n = Math.min(72, Math.max(1, Number(m[1] ?? m[2])));
+      return { sinceDays: -n / 24, markRecent: true };
     },
   },
   {
@@ -56,30 +75,44 @@ const RULES: Array<{
     window: () => ({ sinceDays: -2, untilDays: -0.5 }),
   },
   {
-    re: /today|今天|今天早上/,
+    re: /today|今天/,
     window: () => ({ sinceDays: -1, markRecent: true }),
   },
   /**
    * Guarded idiom rules. The English branches carry negative lookaheads so
-   * adjective/derivative forms never leak a window into an unrelated query:
+   * adjective/derivative/compound forms never leak a window into an
+   * unrelated query:
    *
-   * - `last\s+week(?!ly|s\b)` — "the last weekly report", "last weeks"
-   *   must NOT open a window; bare "last week" must.
-   * - `this\s+week(?!ly)` — "this weekly sync" must NOT open a window.
+   * - `last\s+week(?!ly|s\b|end)` — "the last weekly report", "last
+   *   weeks" AND "last weekend" must NOT open a window (a weekend query
+   * is about the previous weekend's DAYS, which the [-14,-7] week window
+   * would exclude); bare "last week" must open one.
+   * - `this\s+week(?!ly|s\b|end)` — "this weekly sync" and "this
+   *   weekend" must NOT open a window.
    * - `last\s+month(?!ly|s\b)` — "last monthly summary" must NOT open a
    *   window.
+   * - `last\s+year(?!ly|s\b)` — "last yearly review" and "the last
+   *   years" must NOT open a window.
+   * - `past\s+weeks?\b` — \b (not (?!s\b)) because bare plural "past
+   *   weeks" IS a recency idiom; "past weekly" is excluded by the same
+   *   boundary.
    *
    * Regression guard set (locked in test/query-understanding.test.ts):
    * no window for "the last weekly report", "this weekly sync",
-   * "last monthly summary"; window required for "what did we decide last
-   * week", "this week progress", "上个月的部署", "最近 3 天".
+   * "last monthly summary", "last weekend", "the last years"; window
+   * required for "what did we decide last week", "this week progress",
+   * "上个月的部署", "最近 3 天".
    */
   {
-    re: /this\s+week(?!ly)|本周|这周|这一周/,
+    re: /this\s+week(?!ly|s\b|end)|本周|这周|这一周/,
     window: () => ({ sinceDays: -7, markRecent: true }),
   },
   {
-    re: /last\s+week(?!ly|s\b)|上周/,
+    re: /past\s+weeks?\b/,
+    window: () => ({ sinceDays: -7, markRecent: true }),
+  },
+  {
+    re: /last\s+week(?!ly|s\b|end)|上周/,
     window: () => ({ sinceDays: -14, untilDays: -7 }),
   },
   {
@@ -87,12 +120,23 @@ const RULES: Array<{
     window: () => ({ sinceDays: -62, untilDays: -31 }),
   },
   {
+    // The PREVIOUS 365-day window (a year ago, not "within the last
+    // year"), mirroring last week/last month: no markRecent.
+    re: /last\s+year(?!ly|s\b)|去年|上一年/,
+    window: () => ({ sinceDays: -730, untilDays: -365 }),
+  },
+  {
     re: /recently|lately|最近|近期|刚刚/,
     window: () => ({ sinceDays: -7, markRecent: true }),
   },
 ];
 
-const TOPK_RE = /(?:top\s+(\d+)|前\s*(\d+)\s*条?)/i;
+/**
+ * Explicit result-size requests: "top 20", "前 5 条". The `\b` in front of
+ * `top` keeps substring hits out — "laptop 3 days ago" is about a laptop,
+ * not a 3-result request.
+ */
+const TOPK_RE = /(?:\btop\s+(\d+))|(?:前\s*(\d+)\s*条?)/i;
 const PHRASE_RE = /"([^"]{2,80})"|“([^”]{2,80})”/g;
 
 /** Extract structured retrieval hints from a natural-language query. */

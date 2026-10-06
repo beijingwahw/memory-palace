@@ -16,6 +16,11 @@ import { VERSION } from './types/index.js';
 
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
 
+/** Protocol versions this server can speak. `initialize` echoes the
+ *  client-requested version only when it appears here; anything else
+ *  (older, newer, or non-string) falls back to MCP_PROTOCOL_VERSION. */
+const SUPPORTED_PROTOCOL_VERSIONS: ReadonlySet<string> = new Set([MCP_PROTOCOL_VERSION]);
+
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
   id?: number | string | null;
@@ -30,9 +35,9 @@ export interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
-const ERR_PARSE = -32700;
+export const ERR_PARSE = -32700;
 const ERR_METHOD_NOT_FOUND = -32601;
-const ERR_INVALID_PARAMS = -32602;
+export const ERR_INVALID_PARAMS = -32602;
 const ERR_INTERNAL = -32603;
 
 export class McpPalaceServer {
@@ -47,12 +52,21 @@ export class McpPalaceServer {
   async handle(msg: JsonRpcRequest): Promise<JsonRpcResponse> {
     try {
       switch (msg.method) {
-        case 'initialize':
+        case 'initialize': {
+          // Protocol negotiation: honor a client version we actually speak,
+          // otherwise answer with our own (the client decides whether to
+          // downgrade or disconnect).
+          const requested = msg.params?.['protocolVersion'];
+          const protocolVersion =
+            typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested)
+              ? requested
+              : MCP_PROTOCOL_VERSION;
           return ok(msg.id, {
-            protocolVersion: MCP_PROTOCOL_VERSION,
+            protocolVersion,
             capabilities: { tools: {} },
             serverInfo: this.serverInfo,
           });
+        }
         case 'notifications/initialized':
         case 'initialized':
           // notification — no response body needed, but a null result is
@@ -71,15 +85,30 @@ export class McpPalaceServer {
           const args = (msg.params?.['arguments'] ?? {}) as Record<string, unknown>;
           const tool = this.tools.find((t) => t.name === name);
           if (!tool) {
-            return err(msg.id, ERR_METHOD_NOT_FOUND, `unknown tool: ${String(name)}`);
+            // The METHOD exists — an unknown tool name is a bad PARAMETER,
+            // so this is invalid-params (-32602), not method-not-found.
+            return err(msg.id, ERR_INVALID_PARAMS, `unknown tool: ${String(name)}`);
           }
-          if (typeof args !== 'object' || args === null) {
+          // JSON-RPC params must be an OBJECT — `typeof [] === 'object'`
+          // would otherwise let a positional array through and every tool
+          // would destructure undefined fields.
+          if (typeof args !== 'object' || Array.isArray(args)) {
             return err(msg.id, ERR_INVALID_PARAMS, 'arguments must be an object');
           }
           const result = await tool.run(args, this.toolCtx);
+          // Business failures travel in-band (a non-empty `error` field on
+          // the result) rather than as exceptions — mirror that on the MCP
+          // envelope so clients can branch on isError without parsing
+          // content. Successful results keep isError: false.
+          const errorField =
+            typeof result === 'object' && result !== null
+              ? (result as { error?: unknown }).error
+              : undefined;
+          const isError =
+            errorField !== undefined && errorField !== null && errorField !== '';
           return ok(msg.id, {
             content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-            isError: false,
+            isError,
           });
         }
         case 'ping':
